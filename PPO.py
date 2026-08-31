@@ -129,7 +129,8 @@ class Critic(nn.Module):
     def forward(self, x):
         return self.net(x).squeeze(-1)
 
-def collect_rollout(env,
+def collect_rollout(
+    env,
     actor: Actor,
     critic: Critic,
     steps: int, device,
@@ -182,16 +183,14 @@ def collect_rollout(env,
     r.episode_stats = ep_stats
     return r
 
-def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor,
-                last_value: torch.Tensor, gamma: float = 0.99, lam: float = 0.95):
+def compute_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    dones: torch.Tensor,
+    last_value: torch.Tensor,
+    gamma: float = 0.99,
+    lam: float = 0.95):
     """Generalized Advantage Estimation.
-
-    TODO: implement.
-      For t = T-1, T-2, ..., 0:
-        next_value    = values[t+1]  if t+1 < T else last_value
-        next_nonterm  = 1.0 - dones[t]
-        delta_t       = rewards[t] + gamma * next_value * next_nonterm - values[t]
-        A_t           = delta_t + gamma * lam * next_nonterm * A_{t+1}    (with A_T = 0)
 
     Args:
         rewards:    (T,) float
@@ -227,7 +226,8 @@ def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor
         
     return advantages, returns
 
-def train_vec(update_fn: Callable,
+def train(
+    update_fn: Callable,
     env_id: str,
     total_steps: int = 50_000,
     rollout_steps: int = 512,
@@ -240,16 +240,17 @@ def train_vec(update_fn: Callable,
     num_envs=4,
     device=DEFAULT_DEVICE,
     **update_kwargs):
-    """Generic PPO-style training loop.
-    
-    Vector implemetation, note the only differences to train are the make_env_vec and collect_rollout_vec calls
+    """Generic PPO-style training loop
 
     update_fn(rollout_dict, actor, critic, actor_opt, critic_opt, **update_kwargs) -> logs dict
     """
+    
+    # Create environment and store obs and action spaces
     env = make_envs(env_id, num_envs=num_envs, seed=seed)
     obs_dim = env.single_observation_space.shape[0]
     n_actions = env.single_action_space.n
 
+    # Create the actor/critic arcitectures and optimisers
     actor = Actor(obs_dim, n_actions).to(device)
     critic = Critic(obs_dim).to(device)
     actor_opt  = torch.optim.Adam(actor.parameters(),  lr=lr, eps=adam_eps)
@@ -260,6 +261,7 @@ def train_vec(update_fn: Callable,
     recent = deque(maxlen=20)
     n_updates = total_steps // rollout_steps
     
+    # Create learning rate schedulers for the optimisers
     actor_lr_scheduler = torch.optim.lr_scheduler.LinearLR(actor_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
     critic_lr_scheduler = torch.optim.lr_scheduler.LinearLR(critic_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
     
@@ -291,14 +293,8 @@ def train_vec(update_fn: Callable,
     env.close()
     return {'returns': all_returns, 'lengths': all_lengths}
     
-def ppo_update_polished(batch, actor, critic, actor_opt, critic_opt, **cfg):
-    """Phase 5: PPO with the trick checklist.
-
-    TODO: extend ppo_update with the tricks above, one at a time.
-    Suggested config keys:
-        clip_eps, epochs, minibatch_size, vf_coef, ent_coef,
-        clip_vloss (bool), max_grad_norm, norm_adv (bool), target_kl (float or None)
-    Return diagnostics: approx_kl, clip_frac, explained_var, entropy.
+def ppo_update(batch, actor, critic, actor_opt, critic_opt, **cfg):
+    """PPO Update
     """
     gamma: float = cfg.get("gamma", 0.99)
     lam: float = cfg.get("lam", 0.95)
@@ -440,13 +436,13 @@ def main(args):
     print("Environment: ", env_name)
     
     seed = 0
-    total_steps = 50000 #200_000
+    total_steps = 5000 #200_000
     start_time = timeit.default_timer()
-    num_envs = 1
+    num_envs = 4
     rollout_steps = 512 // num_envs
     device = DEFAULT_DEVICE
     
-    run = train_vec(ppo_update_polished, env_name, total_steps=total_steps, seed=seed,
+    run = train(ppo_update, env_name, total_steps=total_steps, seed=seed,
         clip_eps=0.2, epochs=4, minibatch_size=64,
         norm_adv=True, clip_vloss=True, max_grad_norm=0.5,
         ent_coef=0.01, target_kl=0.015,
