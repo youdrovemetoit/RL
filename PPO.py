@@ -14,10 +14,18 @@ DEFAULT_DEVICE="cpu"
 
 @dataclass
 class Rollout:
-    obs:        List = field(default_factory=list)
-    actions:    List = field(default_factory=list)
-    logprobs:   List = field(default_factory=list)  # log π_old(a_t | s_t)
-    rewards:    List = field(default_factory=list)
+    """Represents a rollout of several trajectories for one or more environments.
+    
+    Usually used as a fixed length rollout, that for one environment would look like:
+    [rollout 1, x steps][rollout 2, y steps]...[rollout n, z steps truncated]
+    And last_value is set to the value of the next state after the final step.
+    
+    We store 'dones' so we know where each trajectory ended.
+    """
+    obs:        List = field(default_factory=list)  # Observations
+    actions:    List = field(default_factory=list)  # Actions
+    logprobs:   List = field(default_factory=list)  # Log probabilities of actions: log π_old(a_t | s_t)
+    rewards:    List = field(default_factory=list)  # Rewards
     dones:      List = field(default_factory=list)  # 1.0 if episode ended after step t
     values:     List = field(default_factory=list)  # V_φ(s_t)
     last_value: float = 0.0                         # V_φ(s_T)
@@ -53,6 +61,7 @@ class RunningMeanStd:
         self.mean = 0.0
         self.var = 1.0
         self.count = 1e-4  # small epsilon to avoid div-by-zero
+        
     def update(self, x):
         # Welford's online algorithm — numerically stable running variance
         batch_mean = x.mean().item()
@@ -225,73 +234,6 @@ def compute_gae(
         A_t_1 = A_t
         
     return advantages, returns
-
-def train(
-    update_fn: Callable,
-    env_id: str,
-    total_steps: int = 50_000,
-    rollout_steps: int = 512,
-    seed: int = 0,
-    verbose: bool = True,
-    lr=2.5e-4,
-    adam_eps=1e-8,
-    discountReturns=False,
-    gamma=0.99,
-    num_envs=4,
-    device=DEFAULT_DEVICE,
-    **update_kwargs):
-    """Generic PPO-style training loop
-
-    update_fn(rollout_dict, actor, critic, actor_opt, critic_opt, **update_kwargs) -> logs dict
-    """
-    
-    # Create environment and store obs and action spaces
-    env = make_envs(env_id, num_envs=num_envs, seed=seed)
-    obs_dim = env.single_observation_space.shape[0]
-    n_actions = env.single_action_space.n
-
-    # Create the actor/critic arcitectures and optimisers
-    actor = Actor(obs_dim, n_actions).to(device)
-    critic = Critic(obs_dim).to(device)
-    actor_opt  = torch.optim.Adam(actor.parameters(),  lr=lr, eps=adam_eps)
-    critic_opt = torch.optim.Adam(critic.parameters(), lr=lr, eps=adam_eps)
-
-    all_returns: List[float] = []
-    all_lengths: List[int] = []
-    recent = deque(maxlen=20)
-    n_updates = total_steps // rollout_steps
-    
-    # Create learning rate schedulers for the optimisers
-    actor_lr_scheduler = torch.optim.lr_scheduler.LinearLR(actor_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
-    critic_lr_scheduler = torch.optim.lr_scheduler.LinearLR(critic_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
-    
-    return_rms = None
-    discounted_return = np.zeros(num_envs)
-    if discountReturns:
-        return_rms = RunningMeanStd()
-
-    for update in range(n_updates):
-        rollout = collect_rollout(env, actor, critic, rollout_steps, device, return_rms, discounted_return, gamma)
-        for ep_ret, ep_len in rollout.episode_stats:
-            all_returns.append(ep_ret)
-            all_lengths.append(ep_len)
-            recent.append(ep_ret)
-
-        logs = update_fn(rollout.to_tensors(device), actor, critic,
-                         actor_opt, critic_opt, **update_kwargs)
-
-        if verbose and (update % max(1, n_updates // 20) == 0 or update == n_updates - 1):
-            steps_seen = (update + 1) * rollout_steps
-            recent_mean = np.mean(recent) if recent else float('nan')
-            log_str = " ".join(f"{k}={v:.3f}" for k, v in (logs or {}).items())
-            print(f"[{update+1:>4}/{n_updates},lr={actor_lr_scheduler.get_last_lr()[0]:.2e}] steps={steps_seen:>6}  "
-                  f"recent_ret={recent_mean:6.1f}  {log_str}")
-          
-        actor_lr_scheduler.step()
-        critic_lr_scheduler.step()
-
-    env.close()
-    return {'returns': all_returns, 'lengths': all_lengths}
     
 def ppo_update(batch, actor, critic, actor_opt, critic_opt, **cfg):
     """PPO Update
@@ -427,6 +369,82 @@ def ppo_update(batch, actor, critic, actor_opt, critic_opt, **cfg):
         'explained_variance':explained_var.item(),
         'epochs_used':epochs_used}
 
+class PPOTrainer:
+    def __init__(self, env_id: str, device=DEFAULT_DEVICE):
+        
+        # xxx
+        self.num_envs = 1
+        seed = 0
+        device = "cpu"
+        
+        # Create environment and store obs and action spaces
+        self.env = make_envs(env_id, num_envs=self.num_envs, seed=seed)
+        self.obs_dim = self.env.single_observation_space.shape[0]
+        self.n_actions = self.env.single_action_space.n
+
+        # Create the actor/critic architectures
+        self.actor = Actor(self.obs_dim, self.n_actions).to(device)
+        self.critic = Critic(self.obs_dim).to(device)
+    
+    def train(self,
+        total_steps: int = 50_000,
+        rollout_steps: int = 512,
+        seed: int = 0,
+        verbose: bool = True,
+        lr=2.5e-4,
+        adam_eps=1e-8,
+        discountReturns=False,
+        gamma=0.99,
+        device=DEFAULT_DEVICE,
+        **update_kwargs):
+        """Generic PPO-style training loop
+        """
+        
+        # update_fn(rollout_dict, actor, critic, actor_opt, critic_opt, **update_kwargs) -> logs dict
+        update_fn: Callable = ppo_update
+
+        # Create the actor/critic optimisers
+        actor_opt  = torch.optim.Adam(self.actor.parameters(),  lr=lr, eps=adam_eps)
+        critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr, eps=adam_eps)
+        
+        all_returns: List[float] = []
+        all_lengths: List[int] = []
+        recent = deque(maxlen=20)
+        n_updates = total_steps // rollout_steps
+    
+        # Create learning rate schedulers for the optimisers
+        actor_lr_scheduler = torch.optim.lr_scheduler.LinearLR(actor_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
+        critic_lr_scheduler = torch.optim.lr_scheduler.LinearLR(critic_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
+    
+        return_rms = None
+        discounted_return = np.zeros(self.num_envs)
+        if discountReturns:
+            return_rms = RunningMeanStd()
+
+        for update in range(n_updates):
+            rollout = collect_rollout(self.env, self.actor, self.critic, rollout_steps, device, return_rms, discounted_return, gamma)
+            for ep_ret, ep_len in rollout.episode_stats:
+                all_returns.append(ep_ret)
+                all_lengths.append(ep_len)
+                recent.append(ep_ret)
+
+            logs = update_fn(rollout.to_tensors(device), self.actor, self.critic,
+                             actor_opt, critic_opt, **update_kwargs)
+
+            if verbose and (update % max(1, n_updates // 20) == 0 or update == n_updates - 1):
+                steps_seen = (update + 1) * rollout_steps
+                recent_mean = np.mean(recent) if recent else float('nan')
+                log_str = " ".join(f"{k}={v:.3f}" for k, v in (logs or {}).items())
+                print(f"[{update+1:>4}/{n_updates},lr={actor_lr_scheduler.get_last_lr()[0]:.2e}] steps={steps_seen:>6}  "
+                      f"recent_ret={recent_mean:6.1f}  {log_str}")
+          
+            actor_lr_scheduler.step()
+            critic_lr_scheduler.step()
+
+        self.env.close()
+        return {'returns': all_returns, 'lengths': all_lengths}
+        
+
 def main(args):
     if len(args) < 2:
         print("Require environment")
@@ -435,6 +453,8 @@ def main(args):
     env_name = args[1]
     print("Environment: ", env_name)
     
+    trainer = PPOTrainer(env_name)
+    
     seed = 0
     total_steps = 5000 #200_000
     start_time = timeit.default_timer()
@@ -442,7 +462,7 @@ def main(args):
     rollout_steps = 512 // num_envs
     device = DEFAULT_DEVICE
     
-    run = train(ppo_update, env_name, total_steps=total_steps, seed=seed,
+    run = trainer.train(total_steps=total_steps, seed=seed,
         clip_eps=0.2, epochs=4, minibatch_size=64,
         norm_adv=True, clip_vloss=True, max_grad_norm=0.5,
         ent_coef=0.01, target_kl=0.015,
