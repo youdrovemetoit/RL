@@ -234,22 +234,60 @@ def compute_gae(
         A_t_1 = A_t
         
     return advantages, returns
-    
-def ppo_update(batch, actor, critic, actor_opt, critic_opt, **cfg):
+
+@dataclass
+class PPOTrainerConfig:
+    """Basic parameters for the PPOTrainer class
+    """
+    num_envs = 1
+    seed = 0
+    device = DEFAULT_DEVICE
+
+@dataclass
+class PPOTrainerTrainConfig:
+    """Common RL training paramters
+    """
+    total_steps: int = 50_000
+    rollout_steps: int = 512
+    verbose: bool = True
+    lr = 2.5e-4
+    adam_eps = 1e-8
+    discountReturns = True
+    gamma = 0.99
+
+@dataclass
+class PPOTrainerPPOUpdateConfig:
+    """PPO focused training parameters
+    """
+    clip_eps=0.2,
+    epochs=4,
+    minibatch_size=64,
+    norm_adv=True,
+    clip_vloss=True,
+    max_grad_norm=0.5,
+    ent_coef=0.0,
+    target_kl=None,
+    lam: float = 0.95    
+    vf_coef: float = 0.5
+
+def ppo_update(batch, actor, critic, actor_opt, critic_opt, trainConfig: PPOTrainerTrainConfig, ppoConfig: PPOTrainerPPOUpdateConfig):
     """PPO Update
     """
-    gamma: float = cfg.get("gamma", 0.99)
-    lam: float = cfg.get("lam", 0.95)
-    clip_eps: float = cfg.get("clip_eps", 0.2)
-    epochs: int = cfg.get("epochs", 4)
-    minibatch_size: int = cfg.get("minibatch_size", 64)
-    vf_coef: float = cfg.get("vf_coef", 0.5)
-    ent_coef: float = cfg.get("ent_coef", 0.0)
-    clip_vloss: bool = cfg.get("clip_vloss", True)
-    norm_adv: bool = cfg.get("norm_adv", True)
-    target_kl: float = cfg.get("target_kl", None)
-    max_grad_norm: float = cfg.get("max_grad_norm", 0.5)
     
+    # Unpack the config parameters we need
+    gamma: float = trainConfig.gamma
+    lam: float = ppoConfig.lam
+    clip_eps: float = ppoConfig.clip_eps
+    epochs: int = ppoConfig.epochs
+    minibatch_size: int = ppoConfig.minibatch_size
+    vf_coef: float = ppoConfig.vf_coef
+    ent_coef: float = ppoConfig.ent_coef
+    clip_vloss: bool = ppoConfig.clip_vloss
+    norm_adv: bool = ppoConfig.norm_adv
+    target_kl: float = ppoConfig.target_kl
+    max_grad_norm: float = ppoConfig.max_grad_norm
+    
+    # Compute GAE advantages and returns
     advantages, returns = compute_gae(batch["rewards"],
         batch["values"],
         batch["dones"],
@@ -369,36 +407,38 @@ def ppo_update(batch, actor, critic, actor_opt, critic_opt, **cfg):
         'explained_variance':explained_var.item(),
         'epochs_used':epochs_used}
 
+
 class PPOTrainer:
-    def __init__(self, env_id: str, device=DEFAULT_DEVICE):
+    def __init__(self, env_id: str, config: PPOTrainerConfig):
         
-        # xxx
-        self.num_envs = 1
-        seed = 0
-        device = "cpu"
+        # Get the PPO setup from the passed in config
+        self.num_envs = config.num_envs
+        self.seed = config.seed
+        self.device = config.device
         
         # Create environment and store obs and action spaces
-        self.env = make_envs(env_id, num_envs=self.num_envs, seed=seed)
+        self.env = make_envs(env_id, num_envs=self.num_envs, seed=self.seed)
         self.obs_dim = self.env.single_observation_space.shape[0]
         self.n_actions = self.env.single_action_space.n
 
         # Create the actor/critic architectures
-        self.actor = Actor(self.obs_dim, self.n_actions).to(device)
-        self.critic = Critic(self.obs_dim).to(device)
+        self.actor = Actor(self.obs_dim, self.n_actions).to(self.device)
+        self.critic = Critic(self.obs_dim).to(self.device)
     
     def train(self,
-        total_steps: int = 50_000,
-        rollout_steps: int = 512,
-        seed: int = 0,
-        verbose: bool = True,
-        lr=2.5e-4,
-        adam_eps=1e-8,
-        discountReturns=False,
-        gamma=0.99,
-        device=DEFAULT_DEVICE,
-        **update_kwargs):
+        trainConfig: PPOTrainerTrainConfig,
+        ppoConfig: PPOTrainerPPOUpdateConfig):
         """Generic PPO-style training loop
         """
+        
+        # Get the training config values
+        total_steps: int = trainConfig.total_steps
+        rollout_steps: int = trainConfig.rollout_steps
+        verbose: bool = trainConfig.verbose
+        lr = trainConfig.lr
+        adam_eps = trainConfig.adam_eps
+        discountReturns: bool = trainConfig.discountReturns
+        gamma = trainConfig.gamma,
         
         # update_fn(rollout_dict, actor, critic, actor_opt, critic_opt, **update_kwargs) -> logs dict
         update_fn: Callable = ppo_update
@@ -422,14 +462,14 @@ class PPOTrainer:
             return_rms = RunningMeanStd()
 
         for update in range(n_updates):
-            rollout = collect_rollout(self.env, self.actor, self.critic, rollout_steps, device, return_rms, discounted_return, gamma)
+            rollout = collect_rollout(self.env, self.actor, self.critic, rollout_steps, self.device, return_rms, discounted_return, gamma)
             for ep_ret, ep_len in rollout.episode_stats:
                 all_returns.append(ep_ret)
                 all_lengths.append(ep_len)
                 recent.append(ep_ret)
 
-            logs = update_fn(rollout.to_tensors(device), self.actor, self.critic,
-                             actor_opt, critic_opt, **update_kwargs)
+            logs = update_fn(rollout.to_tensors(self.device), self.actor, self.critic,
+                             actor_opt, critic_opt, trainConfig, ppoConfig)
 
             if verbose and (update % max(1, n_updates // 20) == 0 or update == n_updates - 1):
                 steps_seen = (update + 1) * rollout_steps
@@ -447,27 +487,41 @@ class PPOTrainer:
 
 def main(args):
     if len(args) < 2:
-        print("Require environment")
+        print("Usage: PPO.py <environment name>")
         exit()
         
     env_name = args[1]
     print("Environment: ", env_name)
     
-    trainer = PPOTrainer(env_name)
+    ppoTrainerConfig = PPOTrainerConfig()
+    ppoTrainerConfig.num_envs = 1
+    ppoTrainerConfig.seed = 0
+    ppoTrainerConfig.device = DEFAULT_DEVICE
     
-    seed = 0
-    total_steps = 5000 #200_000
+    trainer = PPOTrainer(env_name, ppoTrainerConfig)
+    
+    trainConfig = PPOTrainerTrainConfig()
+    trainConfig.total_steps = 50000 #200_000
+    trainConfig.rollout_steps = 512 // ppoTrainerConfig.num_envs
+    trainConfig.lr = 2.5e-4
+    trainConfig.adam_eps = 1e-5
+    trainConfig.discountReturns = True
+    
+    ppoConfig = PPOTrainerPPOUpdateConfig()
+    ppoConfig.clip_eps=0.2
+    ppoConfig.epochs=4
+    ppoConfig.minibatch_size=64
+    ppoConfig.norm_adv=True
+    ppoConfig.clip_vloss=True
+    ppoConfig.max_grad_norm=0.5
+    ppoConfig.ent_coef=0.01
+    ppoConfig.target_kl=0.015
+    ppoConfig.lam: float = 0.95    
+    ppoConfig.vf_coef: float = 0.5
+    
     start_time = timeit.default_timer()
-    num_envs = 4
-    rollout_steps = 512 // num_envs
-    device = DEFAULT_DEVICE
     
-    run = trainer.train(total_steps=total_steps, seed=seed,
-        clip_eps=0.2, epochs=4, minibatch_size=64,
-        norm_adv=True, clip_vloss=True, max_grad_norm=0.5,
-        ent_coef=0.01, target_kl=0.015,
-        num_envs=num_envs, rollout_steps=rollout_steps,
-        lr=2.5e-4, adam_eps=1e-5, discountReturns=True, device=device)['returns']
+    run = trainer.train(trainConfig, ppoConfig)['returns']
     elapsed = timeit.default_timer() - start_time
     print("Elapsed: ", elapsed)
 
