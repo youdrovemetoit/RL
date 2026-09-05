@@ -77,7 +77,7 @@ class RunningMeanStd:
         self.var = M2 / tot_count
         self.count = tot_count
 
-def make_envs(env_id: str, num_envs:int=1, seed: int=0):
+def make_envs(env_id: str, num_envs:int=1, async_envs:bool = False, seed: int=0):
     """Makes a vector of environments"""
     def make_one(i):
         def _thunk():
@@ -85,7 +85,10 @@ def make_envs(env_id: str, num_envs:int=1, seed: int=0):
             env.action_space.seed(seed)
             return env
         return _thunk
-    return gym.vector.SyncVectorEnv([make_one(i) for i in range(num_envs)])
+    if async_envs:
+        return gym.vector.AsyncVectorEnv([make_one(i) for i in range(num_envs)])
+    else:
+        return gym.vector.SyncVectorEnv([make_one(i) for i in range(num_envs)])
 
 def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias: float = 0.0):
     """Initialises a layer"""
@@ -142,7 +145,8 @@ def collect_rollout(
     env,
     actor: Actor,
     critic: Critic,
-    steps: int, device,
+    steps: int,
+    device,
     return_rms: RunningMeanStd = None,
     discounted_return = 0.0,
     gamma = 1.0) -> Rollout:
@@ -166,6 +170,7 @@ def collect_rollout(
         done = np.logical_or(terminated, truncated)  # (N,)
         raw_reward = reward.copy()                    # (N,) — save before normalization
 
+        # If we have a RunningMeanStd, normalise the rewards
         if return_rms is not None:
             discounted_return = discounted_return * gamma + reward
             return_rms.update(torch.as_tensor(discounted_return))
@@ -240,6 +245,7 @@ class PPOTrainerConfig:
     """Basic parameters for the PPOTrainer class
     """
     num_envs = 1
+    async_envs = False
     seed = 0
     device = DEFAULT_DEVICE
 
@@ -259,14 +265,14 @@ class PPOTrainerTrainConfig:
 class PPOTrainerPPOUpdateConfig:
     """PPO focused training parameters
     """
-    clip_eps=0.2,
-    epochs=4,
-    minibatch_size=64,
-    norm_adv=True,
-    clip_vloss=True,
-    max_grad_norm=0.5,
-    ent_coef=0.0,
-    target_kl=None,
+    clip_eps=0.2
+    epochs=4
+    minibatch_size=64
+    norm_adv=True
+    clip_vloss=True
+    max_grad_norm=0.5
+    ent_coef=0.0
+    target_kl=None
     lam: float = 0.95    
     vf_coef: float = 0.5
 
@@ -413,11 +419,12 @@ class PPOTrainer:
         
         # Get the PPO setup from the passed in config
         self.num_envs = config.num_envs
+        self.async_envs = config.async_envs
         self.seed = config.seed
         self.device = config.device
         
         # Create environment and store obs and action spaces
-        self.env = make_envs(env_id, num_envs=self.num_envs, seed=self.seed)
+        self.env = make_envs(env_id, num_envs=self.num_envs, async_envs=self.async_envs, seed=self.seed)
         self.obs_dim = self.env.single_observation_space.shape[0]
         self.n_actions = self.env.single_action_space.n
 
@@ -456,21 +463,26 @@ class PPOTrainer:
         actor_lr_scheduler = torch.optim.lr_scheduler.LinearLR(actor_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
         critic_lr_scheduler = torch.optim.lr_scheduler.LinearLR(critic_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
     
+        # Setup discounted returns and running mean/std for normalisation
+        # TODO: I think we should be normalising even if discounted_returns isn't set, check this
         return_rms = None
         discounted_return = np.zeros(self.num_envs)
         if discountReturns:
             return_rms = RunningMeanStd()
 
         for update in range(n_updates):
+            # Collect a fixed length rollout (number of trajectories, with the last one truncated), for each environment
             rollout = collect_rollout(self.env, self.actor, self.critic, rollout_steps, self.device, return_rms, discounted_return, gamma)
             for ep_ret, ep_len in rollout.episode_stats:
                 all_returns.append(ep_ret)
                 all_lengths.append(ep_len)
                 recent.append(ep_ret)
 
+            # Do the PPO Update
             logs = update_fn(rollout.to_tensors(self.device), self.actor, self.critic,
                              actor_opt, critic_opt, trainConfig, ppoConfig)
 
+            # Log stats
             if verbose and (update % max(1, n_updates // 20) == 0 or update == n_updates - 1):
                 steps_seen = (update + 1) * rollout_steps
                 recent_mean = np.mean(recent) if recent else float('nan')
@@ -478,6 +490,7 @@ class PPOTrainer:
                 print(f"[{update+1:>4}/{n_updates},lr={actor_lr_scheduler.get_last_lr()[0]:.2e}] steps={steps_seen:>6}  "
                       f"recent_ret={recent_mean:6.1f}  {log_str}")
           
+            # Update learning rate schedulers
             actor_lr_scheduler.step()
             critic_lr_scheduler.step()
 
@@ -502,7 +515,7 @@ def main(args):
     
     trainConfig = PPOTrainerTrainConfig()
     trainConfig.total_steps = 50000 #200_000
-    trainConfig.rollout_steps = 512 // ppoTrainerConfig.num_envs
+    trainConfig.rollout_steps = 512 # // ppoTrainerConfig.num_envs
     trainConfig.lr = 2.5e-4
     trainConfig.adam_eps = 1e-5
     trainConfig.discountReturns = True
