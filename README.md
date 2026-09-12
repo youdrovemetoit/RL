@@ -8,23 +8,29 @@ This repository contains implementations of foundation RL algorithms, developed 
 
 The very basics, a notebook that samples episodes from the MDP and uses it to determine the value function for the state space. Demonstrated on the FrozenLake gym environment.
 
+### TD-Learning
+
+Implementation of Temporal Difference Learning as opposed to the MC technique above.
+
 ### SARSA $\lambda$
 
-An implementation of SARSA
-
-### Policy Gradient (REINFORCE)
-
-
+An implementation of SARSA-$\lambda$ using eligibility traces. The notebook demonstrates the algorithm on grid world environments with no deep learning.
 
 ### Q-Learning
 
-### TD-Learning
-
-
+An implementation of Q-Learning, essentially using the same notebook as with SARSA-$\lambda$, updated to use the new algorithm.
 
 ### DQN
 
+Introducing some deep learning into the mix now, with this Deep Q-Learning notebook showing how the Q-Learning algorithm can be adapted to use neural networks to increase its flexibility.
+
+### Policy Gradient (REINFORCE)
+
+Implementation of the most basic policy optimisation algorithm.
+
 ### Actor Critic (A2C)
+
+Implementation of the Actor-Critic algorithm, leading us on to PPO.
 
 ### Proximal Policy Optimisation
 
