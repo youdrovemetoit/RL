@@ -1,20 +1,30 @@
-# RL
+# Reinforcement Learning
 
-This repository contains implementations of foundation RL algorithms for learning purposes. All are developed from scratch and are not production ready implementations.
+This repository contains implementations of foundation RL algorithms, developed upwards from base principals. All are developed from scratch to develop an understanding of the processes involved, and should provide a path to understanding modern RL techiques.
 
 ## Overview
 
 ### Monte Carlo
 
+The very basics, a notebook that samples episodes from the MDP and uses it to determine the value function for the state space. Demonstrated on the FrozenLake gym environment.
+
+### SARSA $\lambda$
+
+An implementation of SARSA
+
 ### Policy Gradient (REINFORCE)
+
+
 
 ### Q-Learning
 
 ### TD-Learning
 
-### SARSA $\lambda$
+
 
 ### DQN
+
+### Actor Critic (A2C)
 
 ### Proximal Policy Optimisation
 
