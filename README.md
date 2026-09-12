@@ -18,7 +18,7 @@ An implementation of SARSA-$\lambda$ using eligibility traces. The notebook demo
 
 ### Q-Learning
 
-An implementation of Q-Learning, essentially using the same notebook as with SARSA-$\lambda$, updated to use the new algorithm.
+An implementation of Q-Learning, essentially using the same notebook as with SARSA $\lambda$, updated to use the new algorithm.
 
 ### DQN
 
