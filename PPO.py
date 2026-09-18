@@ -77,12 +77,14 @@ class RunningMeanStd:
         self.var = M2 / tot_count
         self.count = tot_count
 
-def make_envs(env_id: str, num_envs:int=1, async_envs:bool = False, seed: int=0):
+def make_envs(env_id: str, num_envs:int=1, async_envs:bool = False, seed: int=0, make_env_callback=None):
     """Makes a vector of environments"""
     def make_one(i):
         def _thunk():
             env = gym.make(env_id)
             env.action_space.seed(seed)
+            if make_env_callback != None:
+                env = make_env_callback(env)
             return env
         return _thunk
     if async_envs:
@@ -248,6 +250,7 @@ class PPOTrainerConfig:
     async_envs = False
     seed = 0
     device = DEFAULT_DEVICE
+    make_env_callback = None    # Called for each env after creation, for additional gym wrappers, etc
 
 @dataclass
 class PPOTrainerTrainConfig:
@@ -422,9 +425,10 @@ class PPOTrainer:
         self.async_envs = config.async_envs
         self.seed = config.seed
         self.device = config.device
+        self.make_env_callback = config.make_env_callback
         
         # Create environment and store obs and action spaces
-        self.env = make_envs(env_id, num_envs=self.num_envs, async_envs=self.async_envs, seed=self.seed)
+        self.env = make_envs(env_id, num_envs=self.num_envs, async_envs=self.async_envs, seed=self.seed, make_env_callback=self.make_env_callback)
         self.obs_dim = self.env.single_observation_space.shape[0]
         self.n_actions = self.env.single_action_space.n
 
