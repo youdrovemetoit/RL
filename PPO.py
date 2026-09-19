@@ -279,7 +279,7 @@ class PPOTrainerPPOUpdateConfig:
     lam: float = 0.95    
     vf_coef: float = 0.5
 
-def ppo_update(batch, actor, critic, actor_opt, critic_opt, trainConfig: PPOTrainerTrainConfig, ppoConfig: PPOTrainerPPOUpdateConfig):
+def ppo_update(batch, actor, critic, opt, trainConfig: PPOTrainerTrainConfig, ppoConfig: PPOTrainerPPOUpdateConfig):
     """PPO Update
     """
     
@@ -372,8 +372,7 @@ def ppo_update(batch, actor, critic, actor_opt, critic_opt, trainConfig: PPOTrai
             entropy = dist.entropy().mean()
             loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
             
-            actor_opt.zero_grad()
-            critic_opt.zero_grad()
+            opt.zero_grad()
             
             loss.backward()
             
@@ -382,8 +381,7 @@ def ppo_update(batch, actor, critic, actor_opt, critic_opt, trainConfig: PPOTrai
             torch.nn.utils.clip_grad_norm_(actor.parameters(), max_grad_norm)
             torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
             
-            actor_opt.step()
-            critic_opt.step()
+            opt.step()
             
             with torch.no_grad():
                 log_ratio = logprobs_new - minibatch["logprobs"]
@@ -451,12 +449,12 @@ class PPOTrainer:
         discountReturns: bool = trainConfig.discountReturns
         gamma = trainConfig.gamma,
         
-        # update_fn(rollout_dict, actor, critic, actor_opt, critic_opt, **update_kwargs) -> logs dict
+        # update_fn(rollout_dict, actor, critic, opt, **update_kwargs) -> logs dict
         update_fn: Callable = ppo_update
 
         # Create the actor/critic optimisers
-        actor_opt  = torch.optim.Adam(self.actor.parameters(),  lr=lr, eps=adam_eps)
-        critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr, eps=adam_eps)
+        total_params = list(set(self.actor.parameters()) | set(self.critic.parameters()))
+        opt  = torch.optim.Adam(total_params,  lr=lr, eps=adam_eps)
         
         all_returns: List[float] = []
         all_lengths: List[int] = []
@@ -464,8 +462,7 @@ class PPOTrainer:
         n_updates = total_steps // rollout_steps
     
         # Create learning rate schedulers for the optimisers
-        actor_lr_scheduler = torch.optim.lr_scheduler.LinearLR(actor_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
-        critic_lr_scheduler = torch.optim.lr_scheduler.LinearLR(critic_opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
     
         # Setup discounted returns and running mean/std for normalisation
         # TODO: I think we should be normalising even if discounted_returns isn't set, check this
@@ -484,19 +481,18 @@ class PPOTrainer:
 
             # Do the PPO Update
             logs = update_fn(rollout.to_tensors(self.device), self.actor, self.critic,
-                             actor_opt, critic_opt, trainConfig, ppoConfig)
+                             opt, trainConfig, ppoConfig)
 
             # Log stats
             if verbose and (update % max(1, n_updates // 20) == 0 or update == n_updates - 1):
                 steps_seen = (update + 1) * rollout_steps
                 recent_mean = np.mean(recent) if recent else float('nan')
                 log_str = " ".join(f"{k}={v:.3f}" for k, v in (logs or {}).items())
-                print(f"[{update+1:>4}/{n_updates},lr={actor_lr_scheduler.get_last_lr()[0]:.2e}] steps={steps_seen:>6}  "
+                print(f"[{update+1:>4}/{n_updates},lr={lr_scheduler.get_last_lr()[0]:.2e}] steps={steps_seen:>6}  "
                       f"recent_ret={recent_mean:6.1f}  {log_str}")
           
             # Update learning rate schedulers
-            actor_lr_scheduler.step()
-            critic_lr_scheduler.step()
+            lr_scheduler.step()
 
         self.env.close()
         return {'returns': all_returns, 'lengths': all_lengths}
