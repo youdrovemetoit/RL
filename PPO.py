@@ -88,9 +88,9 @@ def make_envs(env_id: str, num_envs:int=1, async_envs:bool = False, seed: int=0,
             return env
         return _thunk
     if async_envs:
-        return gym.vector.AsyncVectorEnv([make_one(i) for i in range(num_envs)])
+        return gym.vector.AsyncVectorEnv([make_one(i) for i in range(num_envs)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
     else:
-        return gym.vector.SyncVectorEnv([make_one(i) for i in range(num_envs)])
+        return gym.vector.SyncVectorEnv([make_one(i) for i in range(num_envs)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
 
 def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias: float = 0.0):
     """Initialises a layer"""
@@ -118,7 +118,7 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias: float = 0.0):
     torch.nn.init.constant_(layer.bias, val=bias)
     return layer
 
-class Actor(nn.Module):
+class Actor(nn.Module):   
     def __init__(self, obs_dim: int, n_actions: int, hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
@@ -145,19 +145,25 @@ class Critic(nn.Module):
 
 def collect_rollout(
     env,
-    actor: Actor,
-    critic: Critic,
+    obs,
+    ep_returns_running,
+    ep_lens_running,
+    actor: nn.Module,
+    critic: nn.Module,
     steps: int,
     device,
     return_rms: RunningMeanStd = None,
     discounted_return = 0.0,
     gamma = 1.0) -> Rollout:
-    """Collects a rollout from an environment"""
+    """Collects a rollout from an environment.
+    
+    Args:
+        env: An environment that is started. We must pass in a running environment and obs to keep collecting observations
+             to form multiple rollouts, as some environments won't end within a single rollout's fixed length
+        obs: The current observation from env
+    """
     N = env.num_envs
     r = Rollout()
-    obs, _ = env.reset()  # shape (N, obs_dim)
-    ep_returns_running = np.zeros(N)
-    ep_lens_running = np.zeros(N, dtype=int)
     ep_stats = []
 
     for _ in range(steps):
@@ -197,7 +203,8 @@ def collect_rollout(
         r.last_value = critic(obs_t).cpu().numpy()   # (N,) now, not scalar
 
     r.episode_stats = ep_stats
-    return r
+    # Return the rollout and running observation and stats
+    return r, obs, ep_returns_running, ep_lens_running, discounted_return
 
 def compute_gae(
     rewards: torch.Tensor,
@@ -274,7 +281,7 @@ class PPOTrainerPPOUpdateConfig:
     norm_adv=True
     clip_vloss=True
     max_grad_norm=0.5
-    ent_coef=0.0
+    ent_coef=0.01
     target_kl=None
     lam: float = 0.95    
     vf_coef: float = 0.5
@@ -304,25 +311,28 @@ def ppo_update(batch, actor, critic, opt, trainConfig: PPOTrainerTrainConfig, pp
         gamma,
         lam)
     
-    # Flatten if we got a vec batch. Must be AFTER GAE — reshape interleaves envs.
-    if batch["obs"].dim() == 3:
-        T, N = batch["obs"].shape[:2]
-        batch = {
-            "obs":      batch["obs"].reshape(T*N, -1),
-            "actions":  batch["actions"].reshape(T*N),
-            "logprobs": batch["logprobs"].reshape(T*N),
-            "values":   batch["values"].reshape(T*N),
-            "rewards":  batch["rewards"].reshape(T*N),
-            "last_value": batch["last_value"],  # (N,), not used past this point
-        }
-        advantages = advantages.reshape(T*N)
-        returns    = returns.reshape(T*N)
+    # Flatten the vec batch. Must be AFTER GAE — reshape interleaves envs.
+    T, N = batch["obs"].shape[:2]
+    batch = {
+        "obs":      batch["obs"].reshape(-1, *batch["obs"].shape[2:]), #batch["obs"].reshape(T*N, -1),
+        "actions":  batch["actions"].reshape(-1, *batch["actions"].shape[2:]), #batch["actions"].reshape(T*N),
+        "logprobs": batch["logprobs"].reshape(-1, *batch["logprobs"].shape[2:]), #batch["logprobs"].reshape(T*N),
+        "values":   batch["values"].reshape(-1, *batch["values"].shape[2:]), #batch["values"].reshape(T*N),
+        "rewards":  batch["rewards"].reshape(-1, *batch["rewards"].shape[2:]), #batch["rewards"].reshape(T*N),
+        "last_value": batch["last_value"],  # (N,), not used past this point
+    }
+    advantages = advantages.reshape(T*N)
+    returns    = returns.reshape(T*N)
     
     clip_frac = []
     policy_losses = []
     value_losses = []
     epochs_used = 0
     update_kls = []
+    
+    # Sometimes the actor and critic can share parameters, such as if they share a CNN head
+    # so we gather the set of paramters to avoid double clipping with clip_grad_norm below
+    total_params = list(set(actor.parameters()) | set(critic.parameters()))
         
     for epoch in range(epochs):
         epoch_kls = []
@@ -378,8 +388,7 @@ def ppo_update(batch, actor, critic, opt, trainConfig: PPOTrainerTrainConfig, pp
             
             # Cap how far a single update can move the parameters, no matter how large the gradient. A safety net
             # for when normalisation isn't enough
-            torch.nn.utils.clip_grad_norm_(actor.parameters(), max_grad_norm)
-            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(total_params, max_grad_norm)
             
             opt.step()
             
@@ -439,6 +448,9 @@ class PPOTrainer:
         ppoConfig: PPOTrainerPPOUpdateConfig):
         """Generic PPO-style training loop
         """
+        # Set train mode just in case
+        self.actor.train()
+        self.critic.train()
         
         # Get the training config values
         total_steps: int = trainConfig.total_steps
@@ -447,7 +459,7 @@ class PPOTrainer:
         lr = trainConfig.lr
         adam_eps = trainConfig.adam_eps
         discountReturns: bool = trainConfig.discountReturns
-        gamma = trainConfig.gamma,
+        gamma = trainConfig.gamma
         
         # update_fn(rollout_dict, actor, critic, opt, **update_kwargs) -> logs dict
         update_fn: Callable = ppo_update
@@ -459,7 +471,7 @@ class PPOTrainer:
         all_returns: List[float] = []
         all_lengths: List[int] = []
         recent = deque(maxlen=20)
-        n_updates = total_steps // rollout_steps
+        n_updates = total_steps // (rollout_steps * self.num_envs)
     
         # Create learning rate schedulers for the optimisers
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
@@ -467,13 +479,19 @@ class PPOTrainer:
         # Setup discounted returns and running mean/std for normalisation
         # TODO: I think we should be normalising even if discounted_returns isn't set, check this
         return_rms = None
-        discounted_return = np.zeros(self.num_envs)
         if discountReturns:
             return_rms = RunningMeanStd()
+        
+        # These must be maintained over multiple rollouts, as one rollout length may not be enough to contain a single trajectory
+        self.next_obs, _ = self.env.reset()  # shape (N, obs_dim)
+        self.ep_returns_running = np.zeros(self.env.num_envs)
+        self.ep_lens_running = np.zeros(self.env.num_envs, dtype=int)
+        self.discounted_return = np.zeros(self.env.num_envs)
 
         for update in range(n_updates):
             # Collect a fixed length rollout (number of trajectories, with the last one truncated), for each environment
-            rollout = collect_rollout(self.env, self.actor, self.critic, rollout_steps, self.device, return_rms, discounted_return, gamma)
+            rollout, self.next_obs, self.ep_returns_running, self.ep_lens_running, self.discounted_return = collect_rollout(
+                self.env, self.next_obs, self.ep_returns_running, self.ep_lens_running, self.actor, self.critic, rollout_steps, self.device, return_rms, self.discounted_return, gamma)
             for ep_ret, ep_len in rollout.episode_stats:
                 all_returns.append(ep_ret)
                 all_lengths.append(ep_len)
@@ -485,7 +503,7 @@ class PPOTrainer:
 
             # Log stats
             if verbose and (update % max(1, n_updates // 20) == 0 or update == n_updates - 1):
-                steps_seen = (update + 1) * rollout_steps
+                steps_seen = (update + 1) * rollout_steps * self.env.num_envs
                 recent_mean = np.mean(recent) if recent else float('nan')
                 log_str = " ".join(f"{k}={v:.3f}" for k, v in (logs or {}).items())
                 print(f"[{update+1:>4}/{n_updates},lr={lr_scheduler.get_last_lr()[0]:.2e}] steps={steps_seen:>6}  "
