@@ -37,3 +37,9 @@ Implementation of the Actor-Critic algorithm, leading us on to PPO.
 Implementation of [PPO](https://arxiv.org/abs/1707.06347), with a number of the optimisations that are typically required to make it function well.
 
 I've shifted most of the code to a Python file that is called by the example notebook. As the implementation becomes more useful than the previous learning notebooks, this will make it easier to experiment and extend to practical use cases.
+
+### PPO - Atari
+
+PPO implementation with Actor/Critic networks suitable for learning from the Atari Gymnasium environments. Architectures based on the original DeepMind paper.
+
+![Breakout](run_videos/ale_py_BreakoutNoFrameskip-v4.gif)
