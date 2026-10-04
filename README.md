@@ -41,5 +41,8 @@ I've shifted most of the code to a Python file that is called by the example not
 ### PPO - Atari
 
 PPO implementation with Actor/Critic networks suitable for learning from the Atari Gymnasium environments. Architectures based on the original DeepMind paper.
+Here are some examples of Atari games post training:
 
-![Breakout](run_videos/ale_py_BreakoutNoFrameskip-v4.gif)
+| Breakout | Pong |
+|:--------:|:----:|
+| ![Breakout](run_videos/ale_py_BreakoutNoFrameskip-v4.gif) | ![Pong](run_videos/ale_py_PongNoFrameskip-v4.gif) |
