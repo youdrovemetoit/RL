@@ -14,7 +14,7 @@ Implementation of Temporal Difference Learning as opposed to the MC technique ab
 
 ### SARSA $\lambda$
 
-An implementation of SARSA-$\lambda$ using eligibility traces. The notebook demonstrates the algorithm on grid world environments with no deep learning.
+An implementation of SARSA-lambda using eligibility traces. The notebook demonstrates the algorithm on grid world environments with no deep learning.
 
 ### Q-Learning
 
