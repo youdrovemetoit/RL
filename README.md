@@ -38,6 +38,10 @@ Implementation of [PPO](https://arxiv.org/abs/1707.06347), with a number of the 
 
 I've shifted most of the code to a Python file that is called by the example notebook. As the implementation becomes more useful than the previous learning notebooks, this will make it easier to experiment and extend to practical use cases.
 
+| LunarLander |
+|:--------:|
+| ![LunarLander](run_videos/LunarLander-v3.gif) |
+
 ### PPO - Atari
 
 PPO implementation with Actor/Critic networks suitable for learning from the Atari Gymnasium environments. Architectures based on the original DeepMind paper.
