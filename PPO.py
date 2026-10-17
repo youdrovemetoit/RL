@@ -118,31 +118,6 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias: float = 0.0):
     torch.nn.init.constant_(layer.bias, val=bias)
     return layer
 
-class Actor(nn.Module):   
-    def __init__(self, obs_dim: int, n_actions: int, hidden: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
-            layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
-            # Policy head: small init so initial logits are ~uniform
-            layer_init(nn.Linear(hidden, n_actions), std=0.01),
-        )
-    def forward(self, x):
-        return self.net(x)  # logits
-    def dist(self, x):
-        return Categorical(logits=self.forward(x))
-
-class Critic(nn.Module):
-    def __init__(self, obs_dim: int, hidden: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
-            layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
-            layer_init(nn.Linear(hidden, 1), std=1.0),
-        )
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
 def collect_rollout(
     env,
     obs,
@@ -258,6 +233,8 @@ class PPOTrainerConfig:
     seed = 0
     device = DEFAULT_DEVICE
     make_env_callback = None    # Called for each env after creation, for additional gym wrappers, etc
+    make_actor = None
+    make_critic = None
 
 @dataclass
 class PPOTrainerTrainConfig:
@@ -433,6 +410,8 @@ class PPOTrainer:
         self.seed = config.seed
         self.device = config.device
         self.make_env_callback = config.make_env_callback
+        self.make_actor = config.make_actor
+        self.make_critic = config.make_critic
         
         # Create environment and store obs and action spaces
         self.env = make_envs(env_id, num_envs=self.num_envs, async_envs=self.async_envs, seed=self.seed, make_env_callback=self.make_env_callback)
@@ -440,8 +419,8 @@ class PPOTrainer:
         self.n_actions = self.env.single_action_space.n
 
         # Create the actor/critic architectures
-        self.actor = Actor(self.obs_dim, self.n_actions).to(self.device)
-        self.critic = Critic(self.obs_dim).to(self.device)
+        self.actor = self.make_actor(self.obs_dim, self.n_actions).to(self.device) #Actor(self.obs_dim, self.n_actions).to(self.device)
+        self.critic = self.make_critic(self.obs_dim).to(self.device) #Critic(self.obs_dim).to(self.device)
     
     def train(self,
         trainConfig: PPOTrainerTrainConfig,
@@ -524,10 +503,37 @@ def main(args):
     env_name = args[1]
     print("Environment: ", env_name)
     
+    class Actor(nn.Module):   
+        def __init__(self, obs_dim: int, n_actions: int, hidden: int = 64):
+            super().__init__()
+            self.net = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
+                layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+                # Policy head: small init so initial logits are ~uniform
+                layer_init(nn.Linear(hidden, n_actions), std=0.01),
+            )
+        def forward(self, x):
+            return self.net(x)  # logits
+        def dist(self, x):
+            return Categorical(logits=self.forward(x))
+
+    class Critic(nn.Module):
+        def __init__(self, obs_dim: int, hidden: int = 64):
+            super().__init__()
+            self.net = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
+                layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+                layer_init(nn.Linear(hidden, 1), std=1.0),
+            )
+        def forward(self, x):
+            return self.net(x).squeeze(-1)
+    
     ppoTrainerConfig = PPOTrainerConfig()
     ppoTrainerConfig.num_envs = 1
     ppoTrainerConfig.seed = 0
     ppoTrainerConfig.device = DEFAULT_DEVICE
+    ppoTrainerConfig.make_actor = lambda o, a: Actor(o, a)
+    ppoTrainerConfig.make_critic = lambda o: Critic(o)
     
     trainer = PPOTrainer(env_name, ppoTrainerConfig)
     
