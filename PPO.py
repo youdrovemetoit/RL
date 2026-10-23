@@ -133,8 +133,9 @@ def collect_rollout(
     """Collects a rollout from an environment.
     
     Args:
-        env: An environment that is started. We must pass in a running environment and obs to keep collecting observations
-             to form multiple rollouts, as some environments won't end within a single rollout's fixed length
+        env: An environment that is started. We must pass in a running environment and the current observation,
+             to keep collecting the observations to form multiple rollouts, as some environments won't end within
+             a single rollout's fixed length
         obs: The current observation from env
     """
     N = env.num_envs
