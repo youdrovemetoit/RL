@@ -1,4 +1,9 @@
+import os
+import sys
 import unittest
+
+sys.path.append(os.path.join(os.getcwd(), ".."))
+import ppo.PPO
 
 class Test(unittest.TestCase):
     
