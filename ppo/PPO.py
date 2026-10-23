@@ -25,7 +25,7 @@ class Rollout:
     obs:        List = field(default_factory=list)  # Observations
     actions:    List = field(default_factory=list)  # Actions
     logprobs:   List = field(default_factory=list)  # Log probabilities of actions: log π_old(a_t | s_t)
-    rewards:    List = field(default_factory=list)  # Rewards
+    rewards:    List = field(default_factory=list)  # Rewards (normalised if return_rms), + gamma * V(final_obs) on truncated (see collect_rollout)
     dones:      List = field(default_factory=list)  # 1.0 if episode ended after step t
     values:     List = field(default_factory=list)  # V_φ(s_t)
     last_value: float = 0.0                         # V_φ(s_T)
@@ -150,9 +150,10 @@ def collect_rollout(
             logprob = dist.log_prob(action)       # (N,)
             value = critic(obs_t)                 # (N,)
 
-        next_obs, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
+        next_obs, reward, terminated, truncated, info = env.step(action.cpu().numpy())
         done = np.logical_or(terminated, truncated)  # (N,)
         raw_reward = reward.copy()                    # (N,) — save before normalization
+        reward = reward.astype(np.float32)
 
         # If we have a RunningMeanStd, normalise the rewards
         if return_rms is not None:
@@ -160,6 +161,20 @@ def collect_rollout(
             return_rms.update(torch.as_tensor(discounted_return))
             reward = reward / (np.sqrt(return_rms.var) + 1e-8)
             discounted_return[done] = 0.0             # reset accumulator per env that ended
+        
+        # Bootstrap in the case of truncated episodes, must happen after normalisation as critic estimates normalised
+        # rewards. Also note, this is done as an alternative to storing terminated, dones, and next_values in the rollout
+        # array and having explicit terminated vs normal/truncated update branches. It produces the same advantages in
+        # GAE, but has the compromise that rewards are not strictly the given rewards from the environment in truncated episodes
+        # Assumes AutoresetMode.SAME_STEP
+        trunc_mask = truncated & ~terminated
+        if trunc_mask.any():
+            final_obs = np.stack(info["final_obs"][trunc_mask]) # Get final observations for truncated environments
+            with torch.no_grad():
+                final_obs_t = torch.as_tensor(final_obs, dtype=torch.float32, device=device)
+                final_v = critic(final_obs_t).cpu().numpy()
+            # Add the estimate value to the reward, is a simple standard trick, and it means GAE can still cut at done
+            reward[trunc_mask] += gamma * final_v
 
         # Store the whole N-wide slice as one row
         r.add(obs, action.cpu().numpy(), logprob.cpu().numpy(), reward, done.astype(np.float32), value.cpu().numpy())
@@ -539,7 +554,7 @@ def main(args):
     trainer = PPOTrainer(env_name, ppoTrainerConfig)
     
     trainConfig = PPOTrainerTrainConfig()
-    trainConfig.total_steps = 50000 #200_000
+    trainConfig.total_steps = 50_000 #200_000
     trainConfig.rollout_steps = 512 # // ppoTrainerConfig.num_envs
     trainConfig.lr = 2.5e-4
     trainConfig.adam_eps = 1e-5
