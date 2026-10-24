@@ -83,7 +83,7 @@ def make_envs(env_id: str, num_envs:int=1, async_envs:bool = False, seed: int=0,
         def _thunk():
             env = gym.make(env_id)
             env.action_space.seed(seed)
-            if make_env_callback != None:
+            if make_env_callback is not None:
                 env = make_env_callback(env)
             return env
         return _thunk
@@ -128,7 +128,7 @@ def collect_rollout(
     steps: int,
     device,
     return_rms: RunningMeanStd = None,
-    discounted_return = 0.0,
+    discounted_return = None,
     gamma = 1.0) -> Rollout:
     """Collects a rollout from an environment.
     
@@ -141,6 +141,8 @@ def collect_rollout(
     N = env.num_envs
     r = Rollout()
     ep_stats = []
+    if discounted_return is None:
+        discounted_return = np.zeros(N)
 
     for _ in range(steps):
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)  # (N, obs_dim)
