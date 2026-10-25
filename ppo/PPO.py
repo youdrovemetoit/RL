@@ -137,6 +137,7 @@ def collect_rollout(
              to keep collecting the observations to form multiple rollouts, as some environments won't end within
              a single rollout's fixed length
         obs: The current observation from env
+        return_rms: Controls reward normalisation. If this is set to a valid RunningMeanStd, rewards are normalised
     """
     N = env.num_envs
     r = Rollout()
@@ -263,7 +264,7 @@ class PPOTrainerTrainConfig:
     verbose: bool = True
     lr = 2.5e-4
     adam_eps = 1e-8
-    discountReturns = True
+    normalise_reward = True
     gamma = 0.99
 
 @dataclass
@@ -455,7 +456,7 @@ class PPOTrainer:
         verbose: bool = trainConfig.verbose
         lr = trainConfig.lr
         adam_eps = trainConfig.adam_eps
-        discountReturns: bool = trainConfig.discountReturns
+        normalise_reward: bool = trainConfig.normalise_reward
         gamma = trainConfig.gamma
         
         # update_fn(rollout_dict, actor, critic, opt, **update_kwargs) -> logs dict
@@ -473,11 +474,8 @@ class PPOTrainer:
         # Create learning rate schedulers for the optimisers
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
     
-        # Setup discounted returns and running mean/std for normalisation
-        # TODO: I think we should be normalising even if discounted_returns isn't set, check this
-        return_rms = None
-        if discountReturns:
-            return_rms = RunningMeanStd()
+        # Setup discounted returns and running mean/std for normalisation, if requested in the config
+        return_rms = RunningMeanStd() if normalise_reward else None
         
         # These must be maintained over multiple rollouts, as one rollout length may not be enough to contain a single trajectory
         self.next_obs, _ = self.env.reset()  # shape (N, obs_dim)
