@@ -7,6 +7,7 @@ import gymnasium as gym
 from dataclasses import dataclass, field
 from typing import List, Callable, Dict, Optional
 from collections import deque
+import random
 import sys
 import timeit
 
@@ -82,9 +83,10 @@ def make_envs(env_id: str, num_envs:int=1, async_envs:bool = False, seed: int=0,
     def make_one(i):
         def _thunk():
             env = gym.make(env_id)
-            env.action_space.seed(seed)
             if make_env_callback is not None:
                 env = make_env_callback(env)
+            # Seed the action space after the callback in case a new wrapper makes a new action space
+            env.action_space.seed(seed+i)
             return env
         return _thunk
     if async_envs:
@@ -432,6 +434,11 @@ class PPOTrainer:
         self.make_actor = config.make_actor
         self.make_critic = config.make_critic
         
+        # Set the seeds; they must be set before the actor/critic are created due to random layer initialisation
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        random.seed(self.seed)
+        
         # Create environment and store obs and action spaces
         self.env = make_envs(env_id, num_envs=self.num_envs, async_envs=self.async_envs, seed=self.seed, make_env_callback=self.make_env_callback)
         self.obs_dim = self.env.single_observation_space.shape[0]
@@ -478,7 +485,7 @@ class PPOTrainer:
         return_rms = RunningMeanStd() if normalise_reward else None
         
         # These must be maintained over multiple rollouts, as one rollout length may not be enough to contain a single trajectory
-        self.next_obs, _ = self.env.reset()  # shape (N, obs_dim)
+        self.next_obs, _ = self.env.reset(seed=self.seed)  # shape (N, obs_dim), seed is auto expanded to seed+i for each vector env
         self.ep_returns_running = np.zeros(self.env.num_envs)
         self.ep_lens_running = np.zeros(self.env.num_envs, dtype=int)
         self.discounted_return = np.zeros(self.env.num_envs)

@@ -6,10 +6,11 @@ from typing import Optional
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.distributions import Categorical
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import ppo.PPO
+from ppo import PPO
 
 # A simple gym environment that returns 1 on every step
 class ConstantEnv(gym.Env):
@@ -65,7 +66,7 @@ class PPOTest(unittest.TestCase):
     
     def test_collect_rollout_truncation(self):
         # Create test environment
-        env = ppo.PPO.make_envs("ConstantEnv", num_envs=2)
+        env = PPO.make_envs("ConstantEnv", num_envs=2)
         self.addCleanup(env.close)
         obs, _ = env.reset()
         
@@ -74,7 +75,7 @@ class PPOTest(unittest.TestCase):
         discounted_return = np.zeros(env.num_envs)
         
         # Get a rollout, episodes truncate after 10 (see gym.register above), which in 25 steps below is steps 9 and 19
-        r, *_ = ppo.PPO.collect_rollout(env, obs, ep_returns_running, ep_lens_running, RandomActor(), ConstantCritic(10.0), steps=25, device="cpu",
+        r, *_ = PPO.collect_rollout(env, obs, ep_returns_running, ep_lens_running, RandomActor(), ConstantCritic(10.0), steps=25, device="cpu",
             return_rms=None, discounted_return=discounted_return, gamma=0.9)
         b = r.to_tensors("cpu")
         
@@ -90,7 +91,7 @@ class PPOTest(unittest.TestCase):
         torch.testing.assert_close(b["rewards"], expected_rewards)
 
         # compute GAE
-        adv, ret = ppo.PPO.compute_gae(b["rewards"], b["values"], b["dones"], b["last_value"], gamma=0.9, lam=0.95)
+        adv, ret = PPO.compute_gae(b["rewards"], b["values"], b["dones"], b["last_value"], gamma=0.9, lam=0.95)
         
         # Check our expected returns are always 10.0
         # Without the bootstrap, step 9 would get a return of 1, and the steps before it would fall short of 10 more and more,
@@ -100,6 +101,71 @@ class PPOTest(unittest.TestCase):
         
         # Check the advantages
         torch.testing.assert_close(adv, torch.zeros_like(adv))
+        
+    def test_seeding(self):
+        env_name = "CartPole-v1"
+    
+        class Actor(nn.Module):   
+            def __init__(self, obs_dim: int, n_actions: int, hidden: int = 64):
+                super().__init__()
+                self.net = nn.Sequential(
+                    PPO.layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
+                    PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+                    PPO.layer_init(nn.Linear(hidden, n_actions), std=0.01),
+                )
+            def forward(self, x):
+                return self.net(x)  # logits
+            def dist(self, x):
+                return Categorical(logits=self.forward(x))
+
+        class Critic(nn.Module):
+            def __init__(self, obs_dim: int, hidden: int = 64):
+                super().__init__()
+                self.net = nn.Sequential(
+                    PPO.layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
+                    PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+                    PPO.layer_init(nn.Linear(hidden, 1), std=1.0),
+                )
+            def forward(self, x):
+                return self.net(x).squeeze(-1)
+    
+        ppoTrainerConfig = PPO.PPOTrainerConfig()
+        ppoTrainerConfig.num_envs = 1
+        ppoTrainerConfig.seed = 0
+        ppoTrainerConfig.device = "cpu"
+        ppoTrainerConfig.make_actor = lambda o, a: Actor(o, a)
+        ppoTrainerConfig.make_critic = lambda o: Critic(o)
+    
+        trainer = PPO.PPOTrainer(env_name, ppoTrainerConfig)
+    
+        trainConfig = PPO.PPOTrainerTrainConfig()
+        trainConfig.total_steps = 4 * 512
+        trainConfig.rollout_steps = 512
+        trainConfig.lr = 2.5e-4
+        trainConfig.adam_eps = 1e-5
+        trainConfig.normalise_reward = True
+        trainConfig.verbose = False
+    
+        ppoConfig = PPO.PPOTrainerPPOUpdateConfig()
+        ppoConfig.clip_eps = 0.2
+        ppoConfig.epochs = 4
+        ppoConfig.minibatch_size = 64
+        ppoConfig.norm_adv = True
+        ppoConfig.clip_vloss = True
+        ppoConfig.max_grad_norm = 0.5
+        ppoConfig.ent_coef = 0.01
+        ppoConfig.target_kl = 0.015
+        ppoConfig.lam = 0.95    
+        ppoConfig.vf_coef = 0.5
+    
+        # Do two runs and check they have the same output when their seeds are the same
+        run = trainer.train(trainConfig, ppoConfig)['returns']
+        
+        trainer = PPO.PPOTrainer(env_name, ppoTrainerConfig)
+        run2 = trainer.train(trainConfig, ppoConfig)['returns']
+        
+        self.assertNotEqual(len(run), 0)
+        self.assertEqual(run, run2)
 
 if __name__ == "__main__":
     unittest.main()
