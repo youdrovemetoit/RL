@@ -54,20 +54,20 @@ class Rollout:
         return len(self.rewards)
 
 class RunningMeanStd:
-    """Used to normalise rewards.
+    """Used to normalise rewards and observations.
     Note: gym has a wrapper that does this, gym.Wrappers.NormalizeReward
     but we do it manually to show how it's done
     """
-    def __init__(self):
-        self.mean = 0.0
-        self.var = 1.0
+    def __init__(self, shape):
+        self.mean = np.zeros(shape)
+        self.var = np.ones(shape)
         self.count = 1e-4  # small epsilon to avoid div-by-zero
         
     def update(self, x):
         # Welford's online algorithm — numerically stable running variance
-        batch_mean = x.mean().item()
-        batch_var = x.var(unbiased=False).item()
-        batch_count = x.numel()
+        batch_mean = x.mean(axis=0)
+        batch_var = x.var(axis=0)
+        batch_count = x.shape[0]
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
         new_mean = self.mean + delta * batch_count / tot_count
@@ -120,6 +120,17 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias: float = 0.0):
     torch.nn.init.constant_(layer.bias, val=bias)
     return layer
 
+def process_observation(obs, obs_rms: RunningMeanStd, update_stats=True):
+    # Expects an obs from env.reset or env.step
+    
+    # Normalise the observation if we have a RunningMeanStd
+    if obs_rms is not None:
+        if update_stats:
+            obs_rms.update(obs)
+        obs = (obs - obs_rms.mean) / (np.sqrt(obs_rms.var) + 1e-8)
+    
+    return obs
+
 def collect_rollout(
     env,
     obs,
@@ -130,6 +141,7 @@ def collect_rollout(
     steps: int,
     device,
     return_rms: RunningMeanStd = None,
+    obs_rms: RunningMeanStd = None,
     discounted_return = None,
     gamma = 1.0) -> Rollout:
     """Collects a rollout from an environment.
@@ -156,6 +168,7 @@ def collect_rollout(
             value = critic(obs_t)                 # (N,)
 
         next_obs, reward, terminated, truncated, info = env.step(action.cpu().numpy())
+        next_obs = process_observation(next_obs, obs_rms) # obs processing, eg normalisation
         done = np.logical_or(terminated, truncated)  # (N,)
         raw_reward = reward.copy()                    # (N,) — save before normalization
         reward = reward.astype(np.float32)
@@ -163,7 +176,8 @@ def collect_rollout(
         # If we have a RunningMeanStd, normalise the rewards
         if return_rms is not None:
             discounted_return = discounted_return * gamma + reward
-            return_rms.update(torch.as_tensor(discounted_return))
+            return_rms.update(discounted_return)
+            # Note: reward normalisation deliberately only scales as shifting changes the problem
             reward = reward / (np.sqrt(return_rms.var) + 1e-8)
             discounted_return[done] = 0.0             # reset accumulator per env that ended
         
@@ -175,6 +189,7 @@ def collect_rollout(
         trunc_mask = truncated & ~terminated
         if trunc_mask.any():
             final_obs = np.stack(info["final_obs"][trunc_mask]) # Get final observations for truncated environments
+            final_obs = process_observation(final_obs, obs_rms, update_stats=False)
             with torch.no_grad():
                 final_obs_t = torch.as_tensor(final_obs, dtype=torch.float32, device=device)
                 final_v = critic(final_obs_t).cpu().numpy()
@@ -245,42 +260,43 @@ def compute_gae(
         
     return advantages, returns
 
-@dataclass
+@dataclass(slots=True)
 class PPOTrainerConfig:
     """Basic parameters for the PPOTrainer class
     """
-    num_envs = 1
-    async_envs = False
-    seed = 0
-    device = DEFAULT_DEVICE
-    make_env_callback = None    # Called for each env after creation, for additional gym wrappers, etc
-    make_actor = None
-    make_critic = None
+    num_envs: int = 1
+    async_envs: bool = False
+    seed: int = 0
+    device: str = DEFAULT_DEVICE
+    make_env_callback: Optional[Callable] = None    # Called for each env after creation, for additional gym wrappers, etc
+    make_actor: Optional[Callable] = None
+    make_critic: Optional[Callable] = None
 
-@dataclass
+@dataclass(slots=True)
 class PPOTrainerTrainConfig:
     """Common RL training paramters
     """
     total_steps: int = 50_000
     rollout_steps: int = 512
     verbose: bool = True
-    lr = 2.5e-4
-    adam_eps = 1e-8
-    normalise_reward = True
-    gamma = 0.99
+    lr: float = 2.5e-4
+    adam_eps: float = 1e-8
+    normalise_reward: bool = False
+    normalise_observations: bool = False
+    gamma: float = 0.99
 
-@dataclass
+@dataclass(slots=True)
 class PPOTrainerPPOUpdateConfig:
     """PPO focused training parameters
     """
-    clip_eps=0.2
-    epochs=4
-    minibatch_size=64
-    norm_adv=True
-    clip_vloss=True
-    max_grad_norm=0.5
-    ent_coef=0.01
-    target_kl=None
+    clip_eps: float = 0.2
+    epochs: int = 4
+    minibatch_size: int = 64
+    norm_adv: bool = True
+    clip_vloss: bool = True
+    max_grad_norm: float = 0.5
+    ent_coef: float = 0.01
+    target_kl: Optional[float] = None
     lam: float = 0.95    
     vf_coef: float = 0.5
 
@@ -464,14 +480,19 @@ class PPOTrainer:
         lr = trainConfig.lr
         adam_eps = trainConfig.adam_eps
         normalise_reward: bool = trainConfig.normalise_reward
+        normalise_observations: bool = trainConfig.normalise_observations
         gamma = trainConfig.gamma
+        
+        # Sanity checks
+        if normalise_observations and len(self.env.single_observation_space.shape) != 1:
+            raise ValueError("Observation normalisation only supports flat (1D) observation spaces")
         
         # update_fn(rollout_dict, actor, critic, opt, **update_kwargs) -> logs dict
         update_fn: Callable = ppo_update
 
         # Create the actor/critic optimisers
         total_params = list(set(self.actor.parameters()) | set(self.critic.parameters()))
-        opt  = torch.optim.Adam(total_params,  lr=lr, eps=adam_eps)
+        opt = torch.optim.Adam(total_params,  lr=lr, eps=adam_eps)
         
         all_returns: List[float] = []
         all_lengths: List[int] = []
@@ -482,10 +503,14 @@ class PPOTrainer:
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
     
         # Setup discounted returns and running mean/std for normalisation, if requested in the config
-        return_rms = RunningMeanStd() if normalise_reward else None
+        return_rms = RunningMeanStd(1) if normalise_reward else None
+        
+        # Setup normalised observations if desired
+        obs_rms = RunningMeanStd(self.obs_dim) if normalise_observations else None
         
         # These must be maintained over multiple rollouts, as one rollout length may not be enough to contain a single trajectory
-        self.next_obs, _ = self.env.reset(seed=self.seed)  # shape (N, obs_dim), seed is auto expanded to seed+i for each vector env
+        next_obs, _ = self.env.reset(seed=self.seed)  # shape (N, obs_dim), seed is auto expanded to seed+i for each vector env
+        self.next_obs = process_observation(next_obs, obs_rms)
         self.ep_returns_running = np.zeros(self.env.num_envs)
         self.ep_lens_running = np.zeros(self.env.num_envs, dtype=int)
         self.discounted_return = np.zeros(self.env.num_envs)
@@ -493,7 +518,19 @@ class PPOTrainer:
         for update in range(n_updates):
             # Collect a fixed length rollout (number of trajectories, with the last one truncated), for each environment
             rollout, self.next_obs, self.ep_returns_running, self.ep_lens_running, self.discounted_return = collect_rollout(
-                self.env, self.next_obs, self.ep_returns_running, self.ep_lens_running, self.actor, self.critic, rollout_steps, self.device, return_rms, self.discounted_return, gamma)
+                env=self.env,
+                obs=self.next_obs,
+                ep_returns_running=self.ep_returns_running,
+                ep_lens_running=self.ep_lens_running,
+                actor=self.actor,
+                critic=self.critic,
+                steps=rollout_steps,
+                device=self.device,
+                return_rms=return_rms,
+                obs_rms=obs_rms,
+                discounted_return=self.discounted_return,
+                gamma=gamma)
+                
             for ep_ret, ep_len in rollout.episode_stats:
                 all_returns.append(ep_ret)
                 all_lengths.append(ep_len)
@@ -565,7 +602,7 @@ def main(args):
     trainConfig.rollout_steps = 512 # // ppoTrainerConfig.num_envs
     trainConfig.lr = 2.5e-4
     trainConfig.adam_eps = 1e-5
-    trainConfig.discountReturns = True
+    trainConfig.normalise_observations = True
     
     ppoConfig = PPOTrainerPPOUpdateConfig()
     ppoConfig.clip_eps=0.2
