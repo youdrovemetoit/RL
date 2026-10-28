@@ -42,7 +42,7 @@ class Rollout:
     def to_tensors(self, device):
         return {
             'obs':        torch.as_tensor(np.asarray(self.obs),      dtype=torch.float32, device=device),
-            'actions':    torch.as_tensor(np.asarray(self.actions),  dtype=torch.long,    device=device),
+            'actions':    torch.as_tensor(np.asarray(self.actions),  device=device),
             'logprobs':   torch.as_tensor(np.asarray(self.logprobs), dtype=torch.float32, device=device),
             'rewards':    torch.as_tensor(np.asarray(self.rewards),  dtype=torch.float32, device=device),
             'dones':      torch.as_tensor(np.asarray(self.dones),    dtype=torch.float32, device=device),
@@ -462,12 +462,10 @@ class PPOTrainer:
         
         # Create environment and store obs and action spaces
         self.env = make_envs(env_id, num_envs=self.num_envs, async_envs=self.async_envs, seed=self.seed, make_env_callback=self.make_env_callback)
-        self.obs_dim = self.env.single_observation_space.shape[0]
-        self.n_actions = self.env.single_action_space.n
 
         # Create the actor/critic architectures
-        self.actor = self.make_actor(self.obs_dim, self.n_actions).to(self.device) #Actor(self.obs_dim, self.n_actions).to(self.device)
-        self.critic = self.make_critic(self.obs_dim).to(self.device) #Critic(self.obs_dim).to(self.device)
+        self.actor = self.make_actor(self.env.single_observation_space, self.env.single_action_space).to(self.device)
+        self.critic = self.make_critic(self.env.single_observation_space).to(self.device)
     
     def train(self,
         trainConfig: PPOTrainerTrainConfig,
@@ -512,7 +510,7 @@ class PPOTrainer:
         return_rms = RunningMeanStd(1) if normalise_reward else None
         
         # Setup normalised observations if desired
-        obs_rms = RunningMeanStd(self.obs_dim) if normalise_observations else None
+        obs_rms = RunningMeanStd(self.env.single_observation_space.shape) if normalise_observations else None
         
         # These must be maintained over multiple rollouts, as one rollout length may not be enough to contain a single trajectory
         next_obs, _ = self.env.reset(seed=self.seed)  # shape (N, obs_dim), seed is auto expanded to seed+i for each vector env
@@ -571,13 +569,15 @@ def main(args):
     print("Environment: ", env_name)
     
     class Actor(nn.Module):   
-        def __init__(self, obs_dim: int, n_actions: int, hidden: int = 64):
+        def __init__(self, obs_space: int, action_space: int, hidden: int = 64):
             super().__init__()
+            self.obs_dim = obs_space.shape[0]
+            self.n_actions = action_space.n
             self.net = nn.Sequential(
-                layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
+                layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
                 layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
                 # Policy head: small init so initial logits are ~uniform
-                layer_init(nn.Linear(hidden, n_actions), std=0.01),
+                layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
             )
         def forward(self, x):
             return self.net(x)  # logits
@@ -585,10 +585,11 @@ def main(args):
             return Categorical(logits=self.forward(x))
 
     class Critic(nn.Module):
-        def __init__(self, obs_dim: int, hidden: int = 64):
+        def __init__(self, obs_space: int, hidden: int = 64):
             super().__init__()
+            self.obs_dim = obs_space.shape[0]
             self.net = nn.Sequential(
-                layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
+                layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
                 layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
                 layer_init(nn.Linear(hidden, 1), std=1.0),
             )
