@@ -120,14 +120,17 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias: float = 0.0):
     torch.nn.init.constant_(layer.bias, val=bias)
     return layer
 
-def process_observation(obs, obs_rms: RunningMeanStd, update_stats=True):
+def process_observation(obs, obs_rms: RunningMeanStd, clip: Optional[float] = None, update_stats: bool=True):
     # Expects an obs from env.reset or env.step
     
     # Normalise the observation if we have a RunningMeanStd
     if obs_rms is not None:
         if update_stats:
-            obs_rms.update(obs)
-        obs = (obs - obs_rms.mean) / (np.sqrt(obs_rms.var) + 1e-8)
+            obs_rms.update(obs)                                        # Stats are always from the raw observations
+        obs = (obs - obs_rms.mean) / (np.sqrt(obs_rms.var) + 1e-8)     # Normalise with current mean/var
+        if clip is not None:
+            obs = np.clip(obs, -clip, clip)                            # Clip the result only (measured in std deviations), it is to protect
+                                                                       # the network from large updates and should not change the tracked stats
     
     return obs
 
@@ -142,6 +145,7 @@ def collect_rollout(
     device,
     return_rms: RunningMeanStd = None,
     obs_rms: RunningMeanStd = None,
+    obs_clip: Optional[float] = None,
     discounted_return = None,
     gamma = 1.0) -> Rollout:
     """Collects a rollout from an environment.
@@ -168,7 +172,7 @@ def collect_rollout(
             value = critic(obs_t)                 # (N,)
 
         next_obs, reward, terminated, truncated, info = env.step(action.cpu().numpy())
-        next_obs = process_observation(next_obs, obs_rms) # obs processing, eg normalisation
+        next_obs = process_observation(next_obs, obs_rms, clip=obs_clip) # obs processing, eg normalisation
         done = np.logical_or(terminated, truncated)  # (N,)
         raw_reward = reward.copy()                    # (N,) — save before normalization
         reward = reward.astype(np.float32)
@@ -189,7 +193,7 @@ def collect_rollout(
         trunc_mask = truncated & ~terminated
         if trunc_mask.any():
             final_obs = np.stack(info["final_obs"][trunc_mask]) # Get final observations for truncated environments
-            final_obs = process_observation(final_obs, obs_rms, update_stats=False)
+            final_obs = process_observation(final_obs, obs_rms, clip=obs_clip, update_stats=False)
             with torch.no_grad():
                 final_obs_t = torch.as_tensor(final_obs, dtype=torch.float32, device=device)
                 final_v = critic(final_obs_t).cpu().numpy()
@@ -283,6 +287,7 @@ class PPOTrainerTrainConfig:
     adam_eps: float = 1e-8
     normalise_reward: bool = False
     normalise_observations: bool = False
+    obs_clip: Optional[float] = 10.0 # None disables clipping
     gamma: float = 0.99
 
 @dataclass(slots=True)
@@ -481,6 +486,7 @@ class PPOTrainer:
         adam_eps = trainConfig.adam_eps
         normalise_reward: bool = trainConfig.normalise_reward
         normalise_observations: bool = trainConfig.normalise_observations
+        obs_clip: Optional[float] = trainConfig.obs_clip
         gamma = trainConfig.gamma
         
         # Sanity checks
@@ -510,7 +516,7 @@ class PPOTrainer:
         
         # These must be maintained over multiple rollouts, as one rollout length may not be enough to contain a single trajectory
         next_obs, _ = self.env.reset(seed=self.seed)  # shape (N, obs_dim), seed is auto expanded to seed+i for each vector env
-        self.next_obs = process_observation(next_obs, obs_rms)
+        self.next_obs = process_observation(next_obs, obs_rms, clip=obs_clip)
         self.ep_returns_running = np.zeros(self.env.num_envs)
         self.ep_lens_running = np.zeros(self.env.num_envs, dtype=int)
         self.discounted_return = np.zeros(self.env.num_envs)
@@ -528,6 +534,7 @@ class PPOTrainer:
                 device=self.device,
                 return_rms=return_rms,
                 obs_rms=obs_rms,
+                obs_clip=obs_clip,
                 discounted_return=self.discounted_return,
                 gamma=gamma)
                 
@@ -603,18 +610,19 @@ def main(args):
     trainConfig.lr = 2.5e-4
     trainConfig.adam_eps = 1e-5
     trainConfig.normalise_observations = True
+    trainConfig.obs_clip = 10.0
     
     ppoConfig = PPOTrainerPPOUpdateConfig()
-    ppoConfig.clip_eps=0.2
-    ppoConfig.epochs=4
-    ppoConfig.minibatch_size=64
-    ppoConfig.norm_adv=True
-    ppoConfig.clip_vloss=True
-    ppoConfig.max_grad_norm=0.5
-    ppoConfig.ent_coef=0.01
-    ppoConfig.target_kl=0.015
-    ppoConfig.lam: float = 0.95    
-    ppoConfig.vf_coef: float = 0.5
+    ppoConfig.clip_eps = 0.2
+    ppoConfig.epochs = 4
+    ppoConfig.minibatch_size = 64
+    ppoConfig.norm_adv = True
+    ppoConfig.clip_vloss = True
+    ppoConfig.max_grad_norm = 0.5
+    ppoConfig.ent_coef = 0.01
+    ppoConfig.target_kl = 0.015
+    ppoConfig.lam = 0.95    
+    ppoConfig.vf_coef = 0.5
     
     start_time = timeit.default_timer()
     
