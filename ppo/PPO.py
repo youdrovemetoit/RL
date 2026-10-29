@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import List, Callable, Dict, Optional
 from collections import deque
 import random
-import sys
+import os, sys
 import timeit
 
 DEFAULT_DEVICE="cpu"
@@ -77,6 +77,12 @@ class RunningMeanStd:
         self.mean = new_mean
         self.var = M2 / tot_count
         self.count = tot_count
+        
+    def state_dict(self):
+        return {"mean": self.mean.copy(), "var": self.var.copy(), "count": self.count}
+    
+    def load_state_dict(self, d):
+        self.mean, self.var, self.count = d["mean"].copy(), d["var"].copy(), d["count"]
 
 def make_envs(env_id: str, num_envs:int=1, async_envs:bool = False, seed: int=0, make_env_callback=None):
     """Makes a vector of environments"""
@@ -445,6 +451,7 @@ def ppo_update(batch, actor, critic, opt, trainConfig: PPOTrainerTrainConfig, pp
 
 class PPOTrainer:
     def __init__(self, env_id: str, config: PPOTrainerConfig):
+        self.config = config
         
         # Get the PPO setup from the passed in config
         self.num_envs = config.num_envs
@@ -476,6 +483,9 @@ class PPOTrainer:
         self.actor.train()
         self.critic.train()
         
+        self.trainConfig = trainConfig
+        self.ppoConfig = ppoConfig
+        
         # Get the training config values
         total_steps: int = trainConfig.total_steps
         rollout_steps: int = trainConfig.rollout_steps
@@ -496,7 +506,7 @@ class PPOTrainer:
 
         # Create the actor/critic optimisers
         total_params = list(set(self.actor.parameters()) | set(self.critic.parameters()))
-        opt = torch.optim.Adam(total_params,  lr=lr, eps=adam_eps)
+        self.opt = torch.optim.Adam(total_params,  lr=lr, eps=adam_eps)
         
         all_returns: List[float] = []
         all_lengths: List[int] = []
@@ -504,17 +514,19 @@ class PPOTrainer:
         n_updates = total_steps // (rollout_steps * self.num_envs)
     
         # Create learning rate schedulers for the optimisers
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
+        self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(self.opt, start_factor=1.0, end_factor=0.0, total_iters=n_updates)
     
         # Setup discounted returns and running mean/std for normalisation, if requested in the config
-        return_rms = RunningMeanStd(1) if normalise_reward else None
+        self.return_rms = RunningMeanStd(1) if normalise_reward else None
         
         # Setup normalised observations if desired
-        obs_rms = RunningMeanStd(self.env.single_observation_space.shape) if normalise_observations else None
+        self.obs_rms = RunningMeanStd(self.env.single_observation_space.shape) if normalise_observations else None
+        
+        # TODO: Resume from HERE before env.reset
         
         # These must be maintained over multiple rollouts, as one rollout length may not be enough to contain a single trajectory
         next_obs, _ = self.env.reset(seed=self.seed)  # shape (N, obs_dim), seed is auto expanded to seed+i for each vector env
-        self.next_obs = process_observation(next_obs, obs_rms, clip=obs_clip)
+        self.next_obs = process_observation(next_obs, self.obs_rms, clip=obs_clip)
         self.ep_returns_running = np.zeros(self.env.num_envs)
         self.ep_lens_running = np.zeros(self.env.num_envs, dtype=int)
         self.discounted_return = np.zeros(self.env.num_envs)
@@ -530,8 +542,8 @@ class PPOTrainer:
                 critic=self.critic,
                 steps=rollout_steps,
                 device=self.device,
-                return_rms=return_rms,
-                obs_rms=obs_rms,
+                return_rms=self.return_rms,
+                obs_rms=self.obs_rms,
                 obs_clip=obs_clip,
                 discounted_return=self.discounted_return,
                 gamma=gamma)
@@ -543,21 +555,54 @@ class PPOTrainer:
 
             # Do the PPO Update
             logs = update_fn(rollout.to_tensors(self.device), self.actor, self.critic,
-                             opt, trainConfig, ppoConfig)
+                             self.opt, trainConfig, ppoConfig)
 
             # Log stats
             if verbose and (update % max(1, n_updates // 20) == 0 or update == n_updates - 1):
                 steps_seen = (update + 1) * rollout_steps * self.env.num_envs
                 recent_mean = np.mean(recent) if recent else float('nan')
                 log_str = " ".join(f"{k}={v:.3f}" for k, v in (logs or {}).items())
-                print(f"[{update+1:>4}/{n_updates},lr={lr_scheduler.get_last_lr()[0]:.2e}] steps={steps_seen:>6}  "
+                print(f"[{update+1:>4}/{n_updates},lr={self.lr_scheduler.get_last_lr()[0]:.2e}] steps={steps_seen:>6}  "
                       f"recent_ret={recent_mean:6.1f}  {log_str}")
           
             # Update learning rate schedulers
-            lr_scheduler.step()
+            self.lr_scheduler.step()
 
         self.env.close()
         return {'returns': all_returns, 'lengths': all_lengths}
+    
+    def save_checkpoint(path, update):
+        checkpoint = {
+            "actor":        self.actor.state_dict(),
+            "crtic":        self.critic.state_dict(),
+            "optimiser":    self.opt.state_dict(),
+            "lr_scheduler": self.lr_scheduler.state_dict(),
+            "obs_rms":      self.obs_rms.state_dict() if self.obs_rms else None,
+            "return_rms":   self.return_rms.state_dict() if self.return_rms else None,
+            "update":       update + 1,
+            "global_step":  (update + 1) * rollout_steps * self.num_envs,
+            "config":       {
+                "config": {k: v for k, v in dataclasses.asdict(self.config).items() if not callable(v)},
+                "trainConfig": {k: v for k, v in dataclasses.asdict(self.trainConfig).items() if not callable(v)},
+                "ppoConfig": {k: v for k, v in dataclasses.asdict(self.ppoConfig).items() if not callable(v)},
+            }
+        }
+        # Save to temp path and replace to reduce the risk of OS restarts while saving large models
+        torch.save(checkpoint, path + ".tmp")
+        os.replace(path + ".tmp", path)
+    
+    def load_checkpoint(path):
+        c = torch.load(path, map_location=self.device, weights_only=False)
+        self.actor.load_state_dict(c["actor"])
+        self.critic.load_state_dict(c["critic"])
+        self.opt.load_state_dict(c["optimiser"])
+        self.lr_scheduler.load_state_dict(c["lr_scheduler"])
+        self.obs_rms.load_state_dict(c["obs_rms"])
+        self.return_rms.load_state_dict(c["return_rms"])
+        
+        start_update = c["update"]
+        global_step = c["global_step"]
+        config = c["config"]
         
 
 def main(args):
