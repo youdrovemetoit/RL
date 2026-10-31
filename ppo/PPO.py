@@ -4,11 +4,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 import gymnasium as gym
+import dataclasses
 from dataclasses import dataclass, field
 from typing import List, Callable, Dict, Optional
 from collections import deque
 import random
 import os, sys
+import shutil
 import timeit
 
 DEFAULT_DEVICE="cpu"
@@ -278,6 +280,7 @@ class PPOTrainerConfig:
     async_envs: bool = False
     seed: int = 0
     device: str = DEFAULT_DEVICE
+    run_dir: Optional[str] = None
     make_env_callback: Optional[Callable] = None    # Called for each env after creation, for additional gym wrappers, etc
     make_actor: Optional[Callable] = None
     make_critic: Optional[Callable] = None
@@ -295,6 +298,7 @@ class PPOTrainerTrainConfig:
     normalise_observations: bool = False
     obs_clip: Optional[float] = 10.0 # None disables clipping
     gamma: float = 0.99
+    checkpoint_every: Optional[int] = None
 
 @dataclass(slots=True)
 class PPOTrainerPPOUpdateConfig:
@@ -357,7 +361,7 @@ def ppo_update(batch, actor, critic, opt, trainConfig: PPOTrainerTrainConfig, pp
     
     # Sometimes the actor and critic can share parameters, such as if they share a CNN head
     # so we gather the set of paramters to avoid double clipping with clip_grad_norm below
-    total_params = list(set(actor.parameters()) | set(critic.parameters()))
+    total_params = list(dict.fromkeys([*actor.parameters(), *critic.parameters()]))
         
     for epoch in range(epochs):
         epoch_kls = []
@@ -452,12 +456,14 @@ def ppo_update(batch, actor, critic, opt, trainConfig: PPOTrainerTrainConfig, pp
 class PPOTrainer:
     def __init__(self, env_id: str, config: PPOTrainerConfig):
         self.config = config
+        self.env_id = env_id
         
         # Get the PPO setup from the passed in config
         self.num_envs = config.num_envs
         self.async_envs = config.async_envs
         self.seed = config.seed
         self.device = config.device
+        self.run_dir = config.run_dir
         self.make_env_callback = config.make_env_callback
         self.make_actor = config.make_actor
         self.make_critic = config.make_critic
@@ -476,8 +482,14 @@ class PPOTrainer:
     
     def train(self,
         trainConfig: PPOTrainerTrainConfig,
-        ppoConfig: PPOTrainerPPOUpdateConfig):
+        ppoConfig: PPOTrainerPPOUpdateConfig,
+        resume_from: Optional[str] = None):
         """Generic PPO-style training loop
+        
+        Args:
+            trainConfig: PPOTrainerTrainConfig options
+            ppoConfig: PPOTrainerPPOUpdateConfig options
+            resume_from: checkpoint path from run to resume from
         """
         # Set train mode just in case
         self.actor.train()
@@ -496,16 +508,24 @@ class PPOTrainer:
         normalise_observations: bool = trainConfig.normalise_observations
         obs_clip: Optional[float] = trainConfig.obs_clip
         gamma = trainConfig.gamma
+        checkpoint_every = trainConfig.checkpoint_every
         
         # Sanity checks
         if normalise_observations and len(self.env.single_observation_space.shape) != 1:
             raise ValueError("Observation normalisation only supports flat (1D) observation spaces")
         
+        # Make space for checkpointing
+        run_dir = "." if self.run_dir is None else self.run_dir
+        checkpoints_path = os.path.join(run_dir, "checkpoints", self.env_id, f"seed_{self.seed}")
+        os.makedirs(checkpoints_path, exist_ok=True)
+        
         # update_fn(rollout_dict, actor, critic, opt, **update_kwargs) -> logs dict
         update_fn: Callable = ppo_update
 
         # Create the actor/critic optimisers
-        total_params = list(set(self.actor.parameters()) | set(self.critic.parameters()))
+        # We use list(dict.fromkeys) as it preserves parameter order for restoring from checkpoint and removes duplicate keys for
+        # base networks, like a CNN encoder
+        total_params = list(dict.fromkeys([*self.actor.parameters(), *self.critic.parameters()]))
         self.opt = torch.optim.Adam(total_params,  lr=lr, eps=adam_eps)
         
         all_returns: List[float] = []
@@ -522,7 +542,14 @@ class PPOTrainer:
         # Setup normalised observations if desired
         self.obs_rms = RunningMeanStd(self.env.single_observation_space.shape) if normalise_observations else None
         
-        # TODO: Resume from HERE before env.reset
+        start_update = 0
+        
+        # Resume from a checkpoint if we are given one
+        if resume_from == "latest":
+            latest = os.path.join(checkpoints_path, "latest.pt")
+            resume_from = latest if os.path.exists(latest) else None
+        if resume_from is not None:
+            start_update = self.load_checkpoint(resume_from)
         
         # These must be maintained over multiple rollouts, as one rollout length may not be enough to contain a single trajectory
         next_obs, _ = self.env.reset(seed=self.seed)  # shape (N, obs_dim), seed is auto expanded to seed+i for each vector env
@@ -531,7 +558,7 @@ class PPOTrainer:
         self.ep_lens_running = np.zeros(self.env.num_envs, dtype=int)
         self.discounted_return = np.zeros(self.env.num_envs)
 
-        for update in range(n_updates):
+        for update in range(start_update, n_updates):
             # Collect a fixed length rollout (number of trajectories, with the last one truncated), for each environment
             rollout, self.next_obs, self.ep_returns_running, self.ep_lens_running, self.discounted_return = collect_rollout(
                 env=self.env,
@@ -567,14 +594,27 @@ class PPOTrainer:
           
             # Update learning rate schedulers
             self.lr_scheduler.step()
+            
+            if checkpoint_every is not None and (update + 1) % checkpoint_every == 0:
+                global_step = (update + 1) * rollout_steps * self.num_envs
+                #print("Checkpoint", global_step)
+                self._checkpoint(checkpoints_path, f"checkpoint_{global_step:09d}.pt", update, rollout_steps)
 
+        # Save final checkpoint
+        self._checkpoint(checkpoints_path, "checkpoint_final.pt", n_updates-1, rollout_steps)
+        
         self.env.close()
         return {'returns': all_returns, 'lengths': all_lengths}
     
-    def save_checkpoint(path, update):
+    def _checkpoint(self, checkpoints_path, name, update, rollout_steps):
+        latest = os.path.join(checkpoints_path, "latest.pt")
+        self.save_checkpoint(latest, update=update, rollout_steps=rollout_steps)
+        shutil.copyfile(latest, os.path.join(checkpoints_path, name))
+    
+    def save_checkpoint(self, path, update, rollout_steps):
         checkpoint = {
             "actor":        self.actor.state_dict(),
-            "crtic":        self.critic.state_dict(),
+            "critic":       self.critic.state_dict(),
             "optimiser":    self.opt.state_dict(),
             "lr_scheduler": self.lr_scheduler.state_dict(),
             "obs_rms":      self.obs_rms.state_dict() if self.obs_rms else None,
@@ -591,19 +631,22 @@ class PPOTrainer:
         torch.save(checkpoint, path + ".tmp")
         os.replace(path + ".tmp", path)
     
-    def load_checkpoint(path):
+    def load_checkpoint(self, path):
         c = torch.load(path, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(c["actor"])
         self.critic.load_state_dict(c["critic"])
         self.opt.load_state_dict(c["optimiser"])
         self.lr_scheduler.load_state_dict(c["lr_scheduler"])
-        self.obs_rms.load_state_dict(c["obs_rms"])
-        self.return_rms.load_state_dict(c["return_rms"])
+        if self.obs_rms is not None:
+            self.obs_rms.load_state_dict(c["obs_rms"])
+        if self.return_rms is not None:
+            self.return_rms.load_state_dict(c["return_rms"])
         
         start_update = c["update"]
         global_step = c["global_step"]
         config = c["config"]
         
+        return start_update
 
 def main(args):
     if len(args) < 2:
@@ -657,6 +700,7 @@ def main(args):
     trainConfig.adam_eps = 1e-5
     trainConfig.normalise_observations = True
     trainConfig.obs_clip = 10.0
+    trainConfig.checkpoint_every = 10
     
     ppoConfig = PPOTrainerPPOUpdateConfig()
     ppoConfig.clip_eps = 0.2
