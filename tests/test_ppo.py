@@ -106,12 +106,15 @@ class PPOTest(unittest.TestCase):
         env_name = "CartPole-v1"
     
         class Actor(nn.Module):   
-            def __init__(self, obs_dim: int, n_actions: int, hidden: int = 64):
+            def __init__(self, obs_space: int, action_space: int, hidden: int = 64):
                 super().__init__()
+                self.obs_dim = obs_space.shape[0]
+                self.n_actions = action_space.n
                 self.net = nn.Sequential(
-                    PPO.layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
+                    PPO.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
                     PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
-                    PPO.layer_init(nn.Linear(hidden, n_actions), std=0.01),
+                    # Policy head: small init so initial logits are ~uniform
+                    PPO.layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
                 )
             def forward(self, x):
                 return self.net(x)  # logits
@@ -119,10 +122,11 @@ class PPOTest(unittest.TestCase):
                 return Categorical(logits=self.forward(x))
 
         class Critic(nn.Module):
-            def __init__(self, obs_dim: int, hidden: int = 64):
+            def __init__(self, obs_space: int, hidden: int = 64):
                 super().__init__()
+                self.obs_dim = obs_space.shape[0]
                 self.net = nn.Sequential(
-                    PPO.layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
+                    PPO.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
                     PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
                     PPO.layer_init(nn.Linear(hidden, 1), std=1.0),
                 )
