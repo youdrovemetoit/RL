@@ -12,8 +12,26 @@ import random
 import os, sys
 import shutil
 import timeit
+import warnings
 
 DEFAULT_DEVICE="cpu"
+
+import warnings
+
+class ResumeConfigWarning(UserWarning):
+    """Raised when resuming from a checkpoint with a config value that differs from the one it was saved with"""
+
+# Resuming with different values for these would silently corrupt the run: the RMS state, LR schedule and step
+# accounting in the checkpoint all assume them
+RESUME_MUST_MATCH = {
+    "config":      {"num_envs"},
+    "trainConfig": {"total_steps", "rollout_steps", "normalise_reward", "normalise_observations"},
+}
+# Bookkeeping fields that are expected to differ between a run and its resume
+RESUME_IGNORE = {
+    "config":      {"device", "run_dir"},
+    "trainConfig": {"verbose", "checkpoint_every"},
+}
 
 @dataclass
 class Rollout:
@@ -606,6 +624,26 @@ class PPOTrainer:
         self.env.close()
         return {'returns': all_returns, 'lengths': all_lengths}
     
+    def _config_snapshot(self):
+        as_dict = lambda cfg: {k: v for k, v in dataclasses.asdict(cfg).items() if not callable(v)}
+        return {"config": as_dict(self.config), "trainConfig": as_dict(self.trainConfig), "ppoConfig": as_dict(self.ppoConfig)}
+
+    def _check_resume_config(self, saved):
+        errors, changed = [], []
+        for section, current in self._config_snapshot().items():
+            previous = saved.get(section, {})
+            for k in sorted(current.keys() | previous.keys()):
+                if k in RESUME_IGNORE.get(section, ()):
+                    continue
+                old, new = previous.get(k, "<missing>"), current.get(k, "<missing>")
+                if old != new:
+                    msg = f"{section}.{k}: checkpoint={old!r}, current={new!r}"
+                    (errors if k in RESUME_MUST_MATCH.get(section, ()) else changed).append(msg)
+        if errors:
+            raise ValueError("Config is incompatible with checkpoint:\n  " + "\n  ".join(errors))
+        for msg in changed:
+            warnings.warn(f"Resuming with a changed config value, {msg}", ResumeConfigWarning)
+    
     def _checkpoint(self, checkpoints_path, name, update, rollout_steps):
         latest = os.path.join(checkpoints_path, "latest.pt")
         self.save_checkpoint(latest, update=update, rollout_steps=rollout_steps)
@@ -621,11 +659,7 @@ class PPOTrainer:
             "return_rms":   self.return_rms.state_dict() if self.return_rms else None,
             "update":       update + 1,
             "global_step":  (update + 1) * rollout_steps * self.num_envs,
-            "config":       {
-                "config": {k: v for k, v in dataclasses.asdict(self.config).items() if not callable(v)},
-                "trainConfig": {k: v for k, v in dataclasses.asdict(self.trainConfig).items() if not callable(v)},
-                "ppoConfig": {k: v for k, v in dataclasses.asdict(self.ppoConfig).items() if not callable(v)},
-            }
+            "config":       self._config_snapshot()
         }
         # Save to temp path and replace to reduce the risk of OS restarts while saving large models
         torch.save(checkpoint, path + ".tmp")
@@ -633,6 +667,7 @@ class PPOTrainer:
     
     def load_checkpoint(self, path):
         c = torch.load(path, map_location=self.device, weights_only=False)
+        self._check_resume_config(c["config"])
         self.actor.load_state_dict(c["actor"])
         self.critic.load_state_dict(c["critic"])
         self.opt.load_state_dict(c["optimiser"])

@@ -1,7 +1,9 @@
 import os
 import sys
+import tempfile
 import unittest
 from typing import Optional
+import warnings
 
 import gymnasium as gym
 import numpy as np
@@ -62,6 +64,34 @@ gym.register(
     max_episode_steps=10
 )
 
+class Actor(nn.Module):   
+    def __init__(self, obs_space: int, action_space: int, hidden: int = 64):
+        super().__init__()
+        self.obs_dim = obs_space.shape[0]
+        self.n_actions = action_space.n
+        self.net = nn.Sequential(
+            PPO.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
+            PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+            # Policy head: small init so initial logits are ~uniform
+            PPO.layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
+        )
+    def forward(self, x):
+        return self.net(x)  # logits
+    def dist(self, x):
+        return Categorical(logits=self.forward(x))
+
+class Critic(nn.Module):
+    def __init__(self, obs_space: int, hidden: int = 64):
+        super().__init__()
+        self.obs_dim = obs_space.shape[0]
+        self.net = nn.Sequential(
+            PPO.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
+            PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+            PPO.layer_init(nn.Linear(hidden, 1), std=1.0),
+        )
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
 class PPOTest(unittest.TestCase):
     
     def test_collect_rollout_truncation(self):
@@ -105,34 +135,6 @@ class PPOTest(unittest.TestCase):
     def test_seeding(self):
         env_name = "CartPole-v1"
     
-        class Actor(nn.Module):   
-            def __init__(self, obs_space: int, action_space: int, hidden: int = 64):
-                super().__init__()
-                self.obs_dim = obs_space.shape[0]
-                self.n_actions = action_space.n
-                self.net = nn.Sequential(
-                    PPO.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
-                    PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
-                    # Policy head: small init so initial logits are ~uniform
-                    PPO.layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
-                )
-            def forward(self, x):
-                return self.net(x)  # logits
-            def dist(self, x):
-                return Categorical(logits=self.forward(x))
-
-        class Critic(nn.Module):
-            def __init__(self, obs_space: int, hidden: int = 64):
-                super().__init__()
-                self.obs_dim = obs_space.shape[0]
-                self.net = nn.Sequential(
-                    PPO.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
-                    PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
-                    PPO.layer_init(nn.Linear(hidden, 1), std=1.0),
-                )
-            def forward(self, x):
-                return self.net(x).squeeze(-1)
-    
         ppoTrainerConfig = PPO.PPOTrainerConfig()
         ppoTrainerConfig.num_envs = 1
         ppoTrainerConfig.seed = 0
@@ -170,6 +172,113 @@ class PPOTest(unittest.TestCase):
         
         self.assertNotEqual(len(run), 0)
         self.assertEqual(run, run2)
+
+    def make_trainer(self, run_dir: str, seed: int=0) -> PPO.PPOTrainer:
+        config = PPO.PPOTrainerConfig()
+        config.num_envs = 2
+        config.seed = seed
+        config.run_dir = run_dir
+        config.make_actor = lambda o, a: Actor(o, a)
+        config.make_critic = lambda o: Critic(o)
+        return PPO.PPOTrainer("CartPole-v1", config)
+    
+    def make_train_config(self, total_steps: int, norm_obs: bool, norm_reward: bool, checkpoint_every: int):
+        train_config = PPO.PPOTrainerTrainConfig()
+        train_config.total_steps = total_steps
+        train_config.rollout_steps = 64
+        train_config.verbose = False
+        train_config.normalise_observations = norm_obs
+        train_config.normalise_reward = norm_reward
+        train_config.checkpoint_every = checkpoint_every
+        return train_config
+    
+    def assertStateDictEqual(self, a, b):
+        self.assertEqual(a.keys(), b.keys())
+        for k in a:
+            self.assertTrue(torch.equal(a[k], b[k]), k)
+    
+    def test_resume(self):
+        STEP = 64 * 2  # steps per update
+        
+        ppo_config = PPO.PPOTrainerPPOUpdateConfig()
+        for norm_obs, norm_reward in [(False, False), (True, True)]:
+            with self.subTest(norm_obs=norm_obs, norm_reward=norm_reward), tempfile.TemporaryDirectory() as tmp:
+                ckpt_dir = lambda run: os.path.join(tmp, run, "checkpoints", "CartPole-v1", "seed_0")
+                
+                # Base run: 4 updates, with snapshots at updates 2 and 4
+                base = self.make_trainer(os.path.join(tmp, "base"))
+                base.train(self.make_train_config(4*STEP, norm_obs, norm_reward, 2), ppo_config)
+                mid_path = os.path.join(ckpt_dir("base"), f"checkpoint_{2*STEP:09d}.pt")
+                # Load data stored at midpoint checkpoint
+                mid = torch.load(mid_path, weights_only=False)
+                
+                # 1. Check loading restores state: resuming with the same total results in 0 updates run
+                final_path = os.path.join(ckpt_dir("base"), f"checkpoint_{4*STEP:09d}.pt")
+                final = torch.load(final_path, weights_only=False)
+
+                loaded = self.make_trainer(os.path.join(tmp, "loaded"))
+                loaded.train(self.make_train_config(4*STEP, norm_obs, norm_reward, None), ppo_config, resume_from=final_path)
+                loaded.load_checkpoint(final_path) # re-load so nothing from train()'s env.reset is mixed in
+                self.assertStateDictEqual(loaded.actor.state_dict(), final["actor"])
+                self.assertStateDictEqual(loaded.critic.state_dict(), final["critic"])
+                if norm_obs:
+                    np.testing.assert_array_equal(loaded.obs_rms.mean, final["obs_rms"]["mean"])
+                    
+                if norm_obs:
+                    np.testing.assert_array_equal(loaded.obs_rms.mean, final["obs_rms"]["mean"])
+                    np.testing.assert_array_equal(loaded.obs_rms.var, final["obs_rms"]["var"])
+                    self.assertEqual(loaded.obs_rms.count, final["obs_rms"]["count"])
+                if norm_reward:
+                    np.testing.assert_array_equal(loaded.return_rms.var, final["return_rms"]["var"])
+
+                # 2. Resume continues: 2 more updates to reach 4
+                resumed = self.make_trainer(os.path.join(tmp, "resumed"))
+                resumed.train(self.make_train_config(4*STEP, norm_obs, norm_reward, 2), ppo_config, resume_from=mid_path)
+                resumed_ckpt = torch.load(os.path.join(ckpt_dir("resumed"), "latest.pt"), weights_only=False)
+                self.assertEqual(resumed_ckpt["update"], 4)
+                self.assertEqual(resumed_ckpt["global_step"], 4*STEP)
+                self.assertEqual(resumed.opt.param_groups[0]["lr"], 0.0)           # schedule finished, not restarted
+                self.assertFalse(os.path.exists(os.path.join(ckpt_dir("resumed"), f"checkpoint_{2*STEP:09d}.pt")))  # didn't redo update 2
+                self.assertFalse(torch.equal(resumed.actor.state_dict()["net.0.weight"], mid["actor"]["net.0.weight"]))  # it trained
+        
+    def test_resume_config_check(self):
+        STEP = 64 * 2
+        ppo_config = PPO.PPOTrainerPPOUpdateConfig()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self.make_trainer(os.path.join(tmp, "base"))
+            base.train(self.make_train_config(2*STEP, True, False, None), ppo_config)
+            path = os.path.join(tmp, "base", "checkpoints", "CartPole-v1", "seed_0", "latest.pt")
+
+            def resume(train_config, ppo=ppo_config):
+                # Fresh run_dir each time; run_dir is in RESUME_IGNORE so this mustn't trigger anything
+                trainer = self.make_trainer(tempfile.mkdtemp(dir=tmp))
+                trainer.train(train_config, ppo, resume_from=path)
+
+            # Matching config (apart from ignored fields): no error and no ResumeConfigWarning
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                resume(self.make_train_config(2*STEP, True, False, 1))   # checkpoint_every differs, but is ignored
+            self.assertFalse([w for w in caught if issubclass(w.category, PPO.ResumeConfigWarning)])
+
+            # Incompatible fields: refuse to resume, and name the field in the error
+            rollout_changed = self.make_train_config(2*STEP, True, False, None)
+            rollout_changed.rollout_steps = 32
+            incompatible = {
+                "total_steps":            self.make_train_config(4*STEP, True, False, None),
+                "normalise_observations": self.make_train_config(2*STEP, False, False, None),
+                "normalise_reward":       self.make_train_config(2*STEP, True, True, None),
+                "rollout_steps":          rollout_changed,
+            }
+            for field, train_config in incompatible.items():
+                with self.subTest(field=field):
+                    with self.assertRaisesRegex(ValueError, field):
+                        resume(train_config)
+
+            # Other changes: resume, but warn and name the field
+            ppo_changed = PPO.PPOTrainerPPOUpdateConfig()
+            ppo_changed.ent_coef = 0.0
+            with self.assertWarnsRegex(PPO.ResumeConfigWarning, "ent_coef"):
+                resume(self.make_train_config(2*STEP, True, False, None), ppo=ppo_changed)
 
 if __name__ == "__main__":
     unittest.main()
