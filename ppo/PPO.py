@@ -470,6 +470,86 @@ def ppo_update(batch, actor, critic, opt, trainConfig: PPOTrainerTrainConfig, pp
         'explained_variance':explained_var.item(),
         'epochs_used':epochs_used}
 
+class CheckpointManager():
+    def __init__(self, trainer: PPOTrainer, run_dir: str):
+        self.trainer = trainer
+        self.run_dir: str = run_dir
+    
+    def try_resume_from(self, resume_from: Optional[str], checkpoints_path: str) -> tuple[bool, int]:
+        is_resuming = False
+        start_update = 0
+        
+        if resume_from == "latest":
+            latest = os.path.join(checkpoints_path, "latest.pt")
+            resume_from = latest if os.path.exists(latest) else None
+        if resume_from is not None:
+            start_update = self.load_checkpoint(resume_from)
+            is_resuming = True
+        
+        return is_resuming, start_update
+    
+    def checkpoint(self, checkpoints_path, name, update, rollout_steps):
+        latest = os.path.join(checkpoints_path, "latest.pt")
+        self.save_checkpoint(latest, update=update, rollout_steps=rollout_steps)
+        shutil.copyfile(latest, os.path.join(checkpoints_path, name))
+    
+    def save_checkpoint(self, path, update, rollout_steps):
+        checkpoint = {
+            "actor":        self.trainer.actor.state_dict(),
+            "critic":       self.trainer.critic.state_dict(),
+            "optimiser":    self.trainer.opt.state_dict(),
+            "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
+            "obs_rms":      self.trainer.obs_rms.state_dict() if self.trainer.obs_rms else None,
+            "return_rms":   self.trainer.return_rms.state_dict() if self.trainer.return_rms else None,
+            "update":       update + 1,
+            "global_step":  (update + 1) * rollout_steps * self.trainer.num_envs,
+            "config":       self._config_snapshot()
+        }
+        # Save to temp path and replace to reduce the risk of OS restarts while saving large models
+        torch.save(checkpoint, path + ".tmp")
+        os.replace(path + ".tmp", path)
+
+    def load_checkpoint(self, path):
+        c = torch.load(path, map_location=self.trainer.device, weights_only=False)
+        self._check_resume_config(c["config"])
+        self.trainer.actor.load_state_dict(c["actor"])
+        self.trainer.critic.load_state_dict(c["critic"])
+        self.trainer.opt.load_state_dict(c["optimiser"])
+        self.trainer.lr_scheduler.load_state_dict(c["lr_scheduler"])
+        if self.trainer.obs_rms is not None:
+            self.trainer.obs_rms.load_state_dict(c["obs_rms"])
+        if self.trainer.return_rms is not None:
+            self.trainer.return_rms.load_state_dict(c["return_rms"])
+
+        start_update = c["update"]
+        global_step = c["global_step"]
+        config = c["config"]
+
+        return start_update
+    
+    def _config_snapshot(self):
+        as_dict = lambda cfg: {k: v for k, v in dataclasses.asdict(cfg).items() if not callable(v)}
+        return {
+            "config": as_dict(self.trainer.config),
+            "trainConfig": as_dict(self.trainer.trainConfig),
+            "ppoConfig": as_dict(self.trainer.ppoConfig)
+            }
+
+    def _check_resume_config(self, saved):
+        errors, changed = [], []
+        for section, current in self._config_snapshot().items():
+            previous = saved.get(section, {})
+            for k in sorted(current.keys() | previous.keys()):
+                if k in RESUME_IGNORE.get(section, ()):
+                    continue
+                old, new = previous.get(k, "<missing>"), current.get(k, "<missing>")
+                if old != new:
+                    msg = f"{section}.{k}: checkpoint={old!r}, current={new!r}"
+                    (errors if k in RESUME_MUST_MATCH.get(section, ()) else changed).append(msg)
+        if errors:
+            raise ValueError("Config is incompatible with checkpoint:\n  " + "\n  ".join(errors))
+        for msg in changed:
+            warnings.warn(f"Resuming with a changed config value, {msg}", ResumeConfigWarning)
 
 class PPOTrainer:
     def __init__(self, env_id: str, config: PPOTrainerConfig):
@@ -497,6 +577,9 @@ class PPOTrainer:
         # Create the actor/critic architectures
         self.actor = self.make_actor(self.env.single_observation_space, self.env.single_action_space).to(self.device)
         self.critic = self.make_critic(self.env.single_observation_space).to(self.device)
+        
+        # Create the checkpoint manager
+        self.checkpoint_manager = CheckpointManager(self, self.run_dir)
     
     def train(self,
         trainConfig: PPOTrainerTrainConfig,
@@ -560,14 +643,10 @@ class PPOTrainer:
         # Setup normalised observations if desired
         self.obs_rms = RunningMeanStd(self.env.single_observation_space.shape) if normalise_observations else None
         
-        start_update = 0
-        
-        # Resume from a checkpoint if we are given one
-        if resume_from == "latest":
-            latest = os.path.join(checkpoints_path, "latest.pt")
-            resume_from = latest if os.path.exists(latest) else None
-        if resume_from is not None:
-            start_update = self.load_checkpoint(resume_from)
+        # Resume from a checkpoint if we are given one. start_update is 0 if not resuming
+        is_resuming, start_update = self.checkpoint_manager.try_resume_from(resume_from, checkpoints_path)
+        if verbose and is_resuming:
+            print("Resuming from checkpoint: ", resume_from)
         
         # These must be maintained over multiple rollouts, as one rollout length may not be enough to contain a single trajectory
         next_obs, _ = self.env.reset(seed=self.seed)  # shape (N, obs_dim), seed is auto expanded to seed+i for each vector env
@@ -599,8 +678,7 @@ class PPOTrainer:
                 recent.append(ep_ret)
 
             # Do the PPO Update
-            logs = update_fn(rollout.to_tensors(self.device), self.actor, self.critic,
-                             self.opt, trainConfig, ppoConfig)
+            logs = update_fn(rollout.to_tensors(self.device), self.actor, self.critic, self.opt, trainConfig, ppoConfig)
 
             # Log stats
             if verbose and (update % max(1, n_updates // 20) == 0 or update == n_updates - 1):
@@ -613,75 +691,16 @@ class PPOTrainer:
             # Update learning rate schedulers
             self.lr_scheduler.step()
             
+            # Intermediate checkpoint
             if checkpoint_every is not None and (update + 1) % checkpoint_every == 0:
                 global_step = (update + 1) * rollout_steps * self.num_envs
-                #print("Checkpoint", global_step)
-                self._checkpoint(checkpoints_path, f"checkpoint_{global_step:09d}.pt", update, rollout_steps)
+                self.checkpoint_manager.checkpoint(checkpoints_path, f"checkpoint_{global_step:09d}.pt", update, rollout_steps)
 
         # Save final checkpoint
-        self._checkpoint(checkpoints_path, "checkpoint_final.pt", n_updates-1, rollout_steps)
+        self.checkpoint_manager.checkpoint(checkpoints_path, "checkpoint_final.pt", n_updates-1, rollout_steps)
         
         self.env.close()
-        return {'returns': all_returns, 'lengths': all_lengths}
-    
-    def _config_snapshot(self):
-        as_dict = lambda cfg: {k: v for k, v in dataclasses.asdict(cfg).items() if not callable(v)}
-        return {"config": as_dict(self.config), "trainConfig": as_dict(self.trainConfig), "ppoConfig": as_dict(self.ppoConfig)}
-
-    def _check_resume_config(self, saved):
-        errors, changed = [], []
-        for section, current in self._config_snapshot().items():
-            previous = saved.get(section, {})
-            for k in sorted(current.keys() | previous.keys()):
-                if k in RESUME_IGNORE.get(section, ()):
-                    continue
-                old, new = previous.get(k, "<missing>"), current.get(k, "<missing>")
-                if old != new:
-                    msg = f"{section}.{k}: checkpoint={old!r}, current={new!r}"
-                    (errors if k in RESUME_MUST_MATCH.get(section, ()) else changed).append(msg)
-        if errors:
-            raise ValueError("Config is incompatible with checkpoint:\n  " + "\n  ".join(errors))
-        for msg in changed:
-            warnings.warn(f"Resuming with a changed config value, {msg}", ResumeConfigWarning)
-    
-    def _checkpoint(self, checkpoints_path, name, update, rollout_steps):
-        latest = os.path.join(checkpoints_path, "latest.pt")
-        self.save_checkpoint(latest, update=update, rollout_steps=rollout_steps)
-        shutil.copyfile(latest, os.path.join(checkpoints_path, name))
-    
-    def save_checkpoint(self, path, update, rollout_steps):
-        checkpoint = {
-            "actor":        self.actor.state_dict(),
-            "critic":       self.critic.state_dict(),
-            "optimiser":    self.opt.state_dict(),
-            "lr_scheduler": self.lr_scheduler.state_dict(),
-            "obs_rms":      self.obs_rms.state_dict() if self.obs_rms else None,
-            "return_rms":   self.return_rms.state_dict() if self.return_rms else None,
-            "update":       update + 1,
-            "global_step":  (update + 1) * rollout_steps * self.num_envs,
-            "config":       self._config_snapshot()
-        }
-        # Save to temp path and replace to reduce the risk of OS restarts while saving large models
-        torch.save(checkpoint, path + ".tmp")
-        os.replace(path + ".tmp", path)
-    
-    def load_checkpoint(self, path):
-        c = torch.load(path, map_location=self.device, weights_only=False)
-        self._check_resume_config(c["config"])
-        self.actor.load_state_dict(c["actor"])
-        self.critic.load_state_dict(c["critic"])
-        self.opt.load_state_dict(c["optimiser"])
-        self.lr_scheduler.load_state_dict(c["lr_scheduler"])
-        if self.obs_rms is not None:
-            self.obs_rms.load_state_dict(c["obs_rms"])
-        if self.return_rms is not None:
-            self.return_rms.load_state_dict(c["return_rms"])
-        
-        start_update = c["update"]
-        global_step = c["global_step"]
-        config = c["config"]
-        
-        return start_update
+        return {'returns': all_returns, 'lengths': all_lengths, 'resumed': is_resuming, 'start_update': start_update}
 
 def main(args):
     if len(args) < 2:

@@ -207,7 +207,8 @@ class PPOTest(unittest.TestCase):
                 
                 # Base run: 4 updates, with snapshots at updates 2 and 4
                 base = self.make_trainer(os.path.join(tmp, "base"))
-                base.train(self.make_train_config(4*STEP, norm_obs, norm_reward, 2), ppo_config)
+                base_info = base.train(self.make_train_config(4*STEP, norm_obs, norm_reward, 2), ppo_config)
+                self.assertFalse(base_info["resumed"])
                 mid_path = os.path.join(ckpt_dir("base"), f"checkpoint_{2*STEP:09d}.pt")
                 # Load data stored at midpoint checkpoint
                 mid = torch.load(mid_path, weights_only=False)
@@ -217,8 +218,9 @@ class PPOTest(unittest.TestCase):
                 final = torch.load(final_path, weights_only=False)
 
                 loaded = self.make_trainer(os.path.join(tmp, "loaded"))
-                loaded.train(self.make_train_config(4*STEP, norm_obs, norm_reward, None), ppo_config, resume_from=final_path)
-                loaded.load_checkpoint(final_path) # re-load so nothing from train()'s env.reset is mixed in
+                loaded_info = loaded.train(self.make_train_config(4*STEP, norm_obs, norm_reward, None), ppo_config, resume_from=final_path)
+                self.assertTrue(loaded_info["resumed"])
+                loaded.checkpoint_manager.load_checkpoint(final_path) # re-load so nothing from train()'s env.reset is mixed in
                 self.assertStateDictEqual(loaded.actor.state_dict(), final["actor"])
                 self.assertStateDictEqual(loaded.critic.state_dict(), final["critic"])
                 if norm_obs:
@@ -233,7 +235,9 @@ class PPOTest(unittest.TestCase):
 
                 # 2. Resume continues: 2 more updates to reach 4
                 resumed = self.make_trainer(os.path.join(tmp, "resumed"))
-                resumed.train(self.make_train_config(4*STEP, norm_obs, norm_reward, 2), ppo_config, resume_from=mid_path)
+                resumed_info = resumed.train(self.make_train_config(4*STEP, norm_obs, norm_reward, 2), ppo_config, resume_from=mid_path)
+                self.assertTrue(resumed_info["resumed"])
+                self.assertEqual(resumed_info["start_update"], 2)
                 resumed_ckpt = torch.load(os.path.join(ckpt_dir("resumed"), "latest.pt"), weights_only=False)
                 self.assertEqual(resumed_ckpt["update"], 4)
                 self.assertEqual(resumed_ckpt["global_step"], 4*STEP)
