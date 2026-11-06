@@ -471,29 +471,38 @@ def ppo_update(batch, actor, critic, opt, trainConfig: PPOTrainerTrainConfig, pp
         'epochs_used':epochs_used}
 
 class CheckpointManager():
-    def __init__(self, trainer, run_dir: str):
+    def __init__(self, trainer):
         self.trainer = trainer
-        self.run_dir: str = run_dir
+        
+        # Make space for checkpointing
+        run_dir = "." if self.trainer.run_dir is None else self.trainer.run_dir
+        checkpoints_path = os.path.join(run_dir, "checkpoints", self.trainer.env_id, f"seed_{self.trainer.seed}")
+        self.checkpoints_path = self._normalise_path(checkpoints_path)
+        os.makedirs(self.checkpoints_path, exist_ok=True)
     
-    def try_resume_from(self, resume_from: Optional[str], checkpoints_path: str) -> tuple[bool, int]:
+    def try_resume_from(self, resume_from: Optional[str]) -> tuple[bool, int]:
         is_resuming = False
         start_update = 0
         
         if resume_from == "latest":
-            latest = os.path.join(checkpoints_path, "latest.pt")
+            latest = os.path.join(self.checkpoints_path, "latest.pt")
             resume_from = latest if os.path.exists(latest) else None
         if resume_from is not None:
-            start_update = self.load_checkpoint(resume_from)
+            start_update = self._load_checkpoint(resume_from)
             is_resuming = True
         
         return is_resuming, start_update
     
-    def checkpoint(self, checkpoints_path, name, update, rollout_steps):
-        latest = os.path.join(checkpoints_path, "latest.pt")
-        self.save_checkpoint(latest, update=update, rollout_steps=rollout_steps)
-        shutil.copyfile(latest, os.path.join(checkpoints_path, name))
+    def checkpoint(self, name, update, rollout_steps):
+        latest = os.path.join(self.checkpoints_path, "latest.pt")
+        self._save_checkpoint(latest, update=update, rollout_steps=rollout_steps)
+        shutil.copyfile(latest, os.path.join(self.checkpoints_path, name))
     
-    def save_checkpoint(self, path, update, rollout_steps):
+    def _normalise_path(self, path):
+        path = path.replace(':', '_')
+        return path
+    
+    def _save_checkpoint(self, path, update, rollout_steps):
         checkpoint = {
             "actor":        self.trainer.actor.state_dict(),
             "critic":       self.trainer.critic.state_dict(),
@@ -509,7 +518,7 @@ class CheckpointManager():
         torch.save(checkpoint, path + ".tmp")
         os.replace(path + ".tmp", path)
 
-    def load_checkpoint(self, path):
+    def _load_checkpoint(self, path):
         c = torch.load(path, map_location=self.trainer.device, weights_only=False)
         self._check_resume_config(c["config"])
         self.trainer.actor.load_state_dict(c["actor"])
@@ -579,7 +588,7 @@ class PPOTrainer:
         self.critic = self.make_critic(self.env.single_observation_space).to(self.device)
         
         # Create the checkpoint manager
-        self.checkpoint_manager = CheckpointManager(self, self.run_dir)
+        self.checkpoint_manager = CheckpointManager(self)
     
     def train(self,
         trainConfig: PPOTrainerTrainConfig,
@@ -615,11 +624,6 @@ class PPOTrainer:
         if normalise_observations and len(self.env.single_observation_space.shape) != 1:
             raise ValueError("Observation normalisation only supports flat (1D) observation spaces")
         
-        # Make space for checkpointing
-        run_dir = "." if self.run_dir is None else self.run_dir
-        checkpoints_path = os.path.join(run_dir, "checkpoints", self.env_id, f"seed_{self.seed}")
-        os.makedirs(checkpoints_path, exist_ok=True)
-        
         # update_fn(rollout_dict, actor, critic, opt, **update_kwargs) -> logs dict
         update_fn: Callable = ppo_update
 
@@ -644,7 +648,7 @@ class PPOTrainer:
         self.obs_rms = RunningMeanStd(self.env.single_observation_space.shape) if normalise_observations else None
         
         # Resume from a checkpoint if we are given one. start_update is 0 if not resuming
-        is_resuming, start_update = self.checkpoint_manager.try_resume_from(resume_from, checkpoints_path)
+        is_resuming, start_update = self.checkpoint_manager.try_resume_from(resume_from)
         if verbose and is_resuming:
             print("Resuming from checkpoint: ", resume_from)
         
@@ -694,10 +698,10 @@ class PPOTrainer:
             # Intermediate checkpoint
             if checkpoint_every is not None and (update + 1) % checkpoint_every == 0:
                 global_step = (update + 1) * rollout_steps * self.num_envs
-                self.checkpoint_manager.checkpoint(checkpoints_path, f"checkpoint_{global_step:09d}.pt", update, rollout_steps)
+                self.checkpoint_manager.checkpoint(f"checkpoint_{global_step:09d}.pt", update, rollout_steps)
 
         # Save final checkpoint
-        self.checkpoint_manager.checkpoint(checkpoints_path, "checkpoint_final.pt", n_updates-1, rollout_steps)
+        self.checkpoint_manager.checkpoint("checkpoint_final.pt", n_updates-1, rollout_steps)
         
         self.env.close()
         return {'returns': all_returns, 'lengths': all_lengths, 'resumed': is_resuming, 'start_update': start_update}

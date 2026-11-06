@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ppo import PPO
+from ppo import ppo
 
 # A simple gym environment that returns 1 on every step
 class ConstantEnv(gym.Env):
@@ -57,7 +57,7 @@ class ConstantCritic(torch.nn.Module):
     def forward(self, x):
         return torch.full((x.shape[0],), self.v)
 
-# Register the environment as PPO.make_envs creates them by id
+# Register the environment as ppo.make_envs creates them by id
 gym.register(
     id="ConstantEnv",
     entry_point=ConstantEnv,
@@ -70,10 +70,10 @@ class Actor(nn.Module):
         self.obs_dim = obs_space.shape[0]
         self.n_actions = action_space.n
         self.net = nn.Sequential(
-            PPO.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
-            PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+            ppo.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
+            ppo.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
             # Policy head: small init so initial logits are ~uniform
-            PPO.layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
+            ppo.layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
         )
     def forward(self, x):
         return self.net(x)  # logits
@@ -85,9 +85,9 @@ class Critic(nn.Module):
         super().__init__()
         self.obs_dim = obs_space.shape[0]
         self.net = nn.Sequential(
-            PPO.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
-            PPO.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
-            PPO.layer_init(nn.Linear(hidden, 1), std=1.0),
+            ppo.layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
+            ppo.layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+            ppo.layer_init(nn.Linear(hidden, 1), std=1.0),
         )
     def forward(self, x):
         return self.net(x).squeeze(-1)
@@ -96,7 +96,7 @@ class PPOTest(unittest.TestCase):
     
     def test_collect_rollout_truncation(self):
         # Create test environment
-        env = PPO.make_envs("ConstantEnv", num_envs=2)
+        env = ppo.make_envs("ConstantEnv", num_envs=2)
         self.addCleanup(env.close)
         obs, _ = env.reset()
         
@@ -105,7 +105,7 @@ class PPOTest(unittest.TestCase):
         discounted_return = np.zeros(env.num_envs)
         
         # Get a rollout, episodes truncate after 10 (see gym.register above), which in 25 steps below is steps 9 and 19
-        r, *_ = PPO.collect_rollout(env, obs, ep_returns_running, ep_lens_running, RandomActor(), ConstantCritic(10.0), steps=25, device="cpu",
+        r, *_ = ppo.collect_rollout(env, obs, ep_returns_running, ep_lens_running, RandomActor(), ConstantCritic(10.0), steps=25, device="cpu",
             return_rms=None, discounted_return=discounted_return, gamma=0.9)
         b = r.to_tensors("cpu")
         
@@ -121,7 +121,7 @@ class PPOTest(unittest.TestCase):
         torch.testing.assert_close(b["rewards"], expected_rewards)
 
         # compute GAE
-        adv, ret = PPO.compute_gae(b["rewards"], b["values"], b["dones"], b["last_value"], gamma=0.9, lam=0.95)
+        adv, ret = ppo.compute_gae(b["rewards"], b["values"], b["dones"], b["last_value"], gamma=0.9, lam=0.95)
         
         # Check our expected returns are always 10.0
         # Without the bootstrap, step 9 would get a return of 1, and the steps before it would fall short of 10 more and more,
@@ -135,16 +135,16 @@ class PPOTest(unittest.TestCase):
     def test_seeding(self):
         env_name = "CartPole-v1"
     
-        ppoTrainerConfig = PPO.PPOTrainerConfig()
+        ppoTrainerConfig = ppo.PPOTrainerConfig()
         ppoTrainerConfig.num_envs = 1
         ppoTrainerConfig.seed = 0
         ppoTrainerConfig.device = "cpu"
         ppoTrainerConfig.make_actor = lambda o, a: Actor(o, a)
         ppoTrainerConfig.make_critic = lambda o: Critic(o)
     
-        trainer = PPO.PPOTrainer(env_name, ppoTrainerConfig)
+        trainer = ppo.PPOTrainer(env_name, ppoTrainerConfig)
     
-        trainConfig = PPO.PPOTrainerTrainConfig()
+        trainConfig = ppo.PPOTrainerTrainConfig()
         trainConfig.total_steps = 4 * 512
         trainConfig.rollout_steps = 512
         trainConfig.lr = 2.5e-4
@@ -152,7 +152,7 @@ class PPOTest(unittest.TestCase):
         trainConfig.normalise_reward = True
         trainConfig.verbose = False
     
-        ppoConfig = PPO.PPOTrainerPPOUpdateConfig()
+        ppoConfig = ppo.PPOTrainerPPOUpdateConfig()
         ppoConfig.clip_eps = 0.2
         ppoConfig.epochs = 4
         ppoConfig.minibatch_size = 64
@@ -167,23 +167,23 @@ class PPOTest(unittest.TestCase):
         # Do two runs and check they have the same output when their seeds are the same
         run = trainer.train(trainConfig, ppoConfig)['returns']
         
-        trainer = PPO.PPOTrainer(env_name, ppoTrainerConfig)
+        trainer = ppo.PPOTrainer(env_name, ppoTrainerConfig)
         run2 = trainer.train(trainConfig, ppoConfig)['returns']
         
         self.assertNotEqual(len(run), 0)
         self.assertEqual(run, run2)
 
-    def make_trainer(self, run_dir: str, seed: int=0) -> PPO.PPOTrainer:
-        config = PPO.PPOTrainerConfig()
+    def make_trainer(self, run_dir: str, seed: int=0) -> ppo.PPOTrainer:
+        config = ppo.PPOTrainerConfig()
         config.num_envs = 2
         config.seed = seed
         config.run_dir = run_dir
         config.make_actor = lambda o, a: Actor(o, a)
         config.make_critic = lambda o: Critic(o)
-        return PPO.PPOTrainer("CartPole-v1", config)
+        return ppo.PPOTrainer("CartPole-v1", config)
     
     def make_train_config(self, total_steps: int, norm_obs: bool, norm_reward: bool, checkpoint_every: int):
-        train_config = PPO.PPOTrainerTrainConfig()
+        train_config = ppo.PPOTrainerTrainConfig()
         train_config.total_steps = total_steps
         train_config.rollout_steps = 64
         train_config.verbose = False
@@ -200,7 +200,7 @@ class PPOTest(unittest.TestCase):
     def test_resume(self):
         STEP = 64 * 2  # steps per update
         
-        ppo_config = PPO.PPOTrainerPPOUpdateConfig()
+        ppo_config = ppo.PPOTrainerPPOUpdateConfig()
         for norm_obs, norm_reward in [(False, False), (True, True)]:
             with self.subTest(norm_obs=norm_obs, norm_reward=norm_reward), tempfile.TemporaryDirectory() as tmp:
                 ckpt_dir = lambda run: os.path.join(tmp, run, "checkpoints", "CartPole-v1", "seed_0")
@@ -220,7 +220,7 @@ class PPOTest(unittest.TestCase):
                 loaded = self.make_trainer(os.path.join(tmp, "loaded"))
                 loaded_info = loaded.train(self.make_train_config(4*STEP, norm_obs, norm_reward, None), ppo_config, resume_from=final_path)
                 self.assertTrue(loaded_info["resumed"])
-                loaded.checkpoint_manager.load_checkpoint(final_path) # re-load so nothing from train()'s env.reset is mixed in
+                loaded.checkpoint_manager._load_checkpoint(final_path) # re-load so nothing from train()'s env.reset is mixed in
                 self.assertStateDictEqual(loaded.actor.state_dict(), final["actor"])
                 self.assertStateDictEqual(loaded.critic.state_dict(), final["critic"])
                 if norm_obs:
@@ -247,7 +247,7 @@ class PPOTest(unittest.TestCase):
         
     def test_resume_config_check(self):
         STEP = 64 * 2
-        ppo_config = PPO.PPOTrainerPPOUpdateConfig()
+        ppo_config = ppo.PPOTrainerPPOUpdateConfig()
         with tempfile.TemporaryDirectory() as tmp:
             base = self.make_trainer(os.path.join(tmp, "base"))
             base.train(self.make_train_config(2*STEP, True, False, None), ppo_config)
@@ -262,7 +262,7 @@ class PPOTest(unittest.TestCase):
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 resume(self.make_train_config(2*STEP, True, False, 1))   # checkpoint_every differs, but is ignored
-            self.assertFalse([w for w in caught if issubclass(w.category, PPO.ResumeConfigWarning)])
+            self.assertFalse([w for w in caught if issubclass(w.category, ppo.ResumeConfigWarning)])
 
             # Incompatible fields: refuse to resume, and name the field in the error
             rollout_changed = self.make_train_config(2*STEP, True, False, None)
@@ -279,9 +279,9 @@ class PPOTest(unittest.TestCase):
                         resume(train_config)
 
             # Other changes: resume, but warn and name the field
-            ppo_changed = PPO.PPOTrainerPPOUpdateConfig()
+            ppo_changed = ppo.PPOTrainerPPOUpdateConfig()
             ppo_changed.ent_coef = 0.0
-            with self.assertWarnsRegex(PPO.ResumeConfigWarning, "ent_coef"):
+            with self.assertWarnsRegex(ppo.ResumeConfigWarning, "ent_coef"):
                 resume(self.make_train_config(2*STEP, True, False, None), ppo=ppo_changed)
 
 if __name__ == "__main__":
