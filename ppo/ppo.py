@@ -471,7 +471,7 @@ def ppo_update(batch, actor, critic, opt, trainConfig: PPOTrainerTrainConfig, pp
         'epochs_used':epochs_used}
 
 class CheckpointManager():
-    def __init__(self, trainer: PPOTrainer, run_dir: str):
+    def __init__(self, trainer, run_dir: str):
         self.trainer = trainer
         self.run_dir: str = run_dir
     
@@ -738,35 +738,38 @@ def main(args):
         def forward(self, x):
             return self.net(x).squeeze(-1)
     
-    ppoTrainerConfig = PPOTrainerConfig()
-    ppoTrainerConfig.num_envs = 1
-    ppoTrainerConfig.seed = 0
-    ppoTrainerConfig.device = DEFAULT_DEVICE
-    ppoTrainerConfig.make_actor = lambda o, a: Actor(o, a)
-    ppoTrainerConfig.make_critic = lambda o: Critic(o)
+    ppoTrainerConfig = PPOTrainerConfig(
+        num_envs = 1,
+        seed = 0,
+        device = DEFAULT_DEVICE,
+        make_actor = lambda o, a: Actor(o, a),
+        make_critic = lambda o: Critic(o)
+    )
     
     trainer = PPOTrainer(env_name, ppoTrainerConfig)
     
-    trainConfig = PPOTrainerTrainConfig()
-    trainConfig.total_steps = 50_000 #200_000
-    trainConfig.rollout_steps = 512 # // ppoTrainerConfig.num_envs
-    trainConfig.lr = 2.5e-4
-    trainConfig.adam_eps = 1e-5
-    trainConfig.normalise_observations = True
-    trainConfig.obs_clip = 10.0
-    trainConfig.checkpoint_every = 10
+    trainConfig = PPOTrainerTrainConfig(
+        total_steps = 50_000, #200_000
+        rollout_steps = 512, # // ppoTrainerConfig.num_envs
+        lr = 2.5e-4,
+        adam_eps = 1e-5,
+        normalise_observations = True,
+        obs_clip = 10.0,
+        checkpoint_every = 10
+    )
     
-    ppoConfig = PPOTrainerPPOUpdateConfig()
-    ppoConfig.clip_eps = 0.2
-    ppoConfig.epochs = 4
-    ppoConfig.minibatch_size = 64
-    ppoConfig.norm_adv = True
-    ppoConfig.clip_vloss = True
-    ppoConfig.max_grad_norm = 0.5
-    ppoConfig.ent_coef = 0.01
-    ppoConfig.target_kl = 0.015
-    ppoConfig.lam = 0.95    
-    ppoConfig.vf_coef = 0.5
+    ppoConfig = PPOTrainerPPOUpdateConfig(
+        clip_eps = 0.2,
+        epochs = 4,
+        minibatch_size = 64,
+        norm_adv = True,
+        clip_vloss = True,
+        max_grad_norm = 0.5,
+        ent_coef = 0.01,
+        target_kl = 0.015,
+        lam = 0.95    ,
+        vf_coef = 0.5
+    )
     
     start_time = timeit.default_timer()
     
