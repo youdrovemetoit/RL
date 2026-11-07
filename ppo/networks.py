@@ -61,14 +61,14 @@ class CNNEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.cnn = nn.Sequential(
-            ppo.layer_init(nn.Conv2d(4, 32, kernel_size=8, stride=4)),
+            layer_init(nn.Conv2d(4, 32, kernel_size=8, stride=4)),
             nn.ReLU(),
-            ppo.layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2)),
+            layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2)),
             nn.ReLU(),
-            ppo.layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1)),
+            layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1)),
             nn.ReLU(),
             nn.Flatten(),
-            ppo.layer_init(nn.Linear(64 * 7 * 7, 512)),
+            layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU()
         )
 
@@ -86,8 +86,8 @@ class VisionActor(nn.Module):
         self.cnn = cnn
 
         self.net = nn.Sequential(
-            ppo.layer_init(nn.Linear(512, hidden)), nn.Tanh(),
-            ppo.layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
+            layer_init(nn.Linear(512, hidden)), nn.Tanh(),
+            layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
         )
 
     def forward(self, x):
@@ -102,8 +102,8 @@ class VisionCritic(nn.Module):
         super().__init__()
         self.cnn = cnn
         self.net = nn.Sequential(
-            ppo.layer_init(nn.Linear(512, hidden)), nn.Tanh(),
-            ppo.layer_init(nn.Linear(hidden, 1), std=1.0),
+            layer_init(nn.Linear(512, hidden)), nn.Tanh(),
+            layer_init(nn.Linear(hidden, 1), std=1.0),
         )
 
     def forward(self, x):
