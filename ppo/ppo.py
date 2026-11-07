@@ -11,6 +11,7 @@ import random
 import sys
 import timeit
 from checkpoints import CheckpointManager
+from networks import SimpleActor, SimpleCritic
 
 DEFAULT_DEVICE="cpu"
 
@@ -100,32 +101,6 @@ def make_envs(env_id: str, num_envs:int=1, async_envs:bool = False, seed: int=0,
         return gym.vector.AsyncVectorEnv([make_one(i) for i in range(num_envs)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
     else:
         return gym.vector.SyncVectorEnv([make_one(i) for i in range(num_envs)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
-
-def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias: float = 0.0):
-    """Initialises a layer"""
-    # Orthogonal initialization fills a weight matrix with random values, then projects the matrix onto the nearest
-    # orthogonal matrix. As orthogonal matrices preserve norms. When you pass a vector x through Wx, ||Wx|| = ||x||
-    # if W is orthogonal.
-    # Stack many such layers and activations neither explode nor vanish at initialization — which is a very different
-    # starting point from the default PyTorch init (Kaiming uniform for nn.Linear), where the scale of pre-activations
-    # can drift meaningfully through depth
-    
-    # The std (gain) parameter scales the orthogonal matrix
-    # - std=sqrt(2) for hidden layers: this is "He initialization" adapted for orthogonal — it's the gain that preserves
-    #   variance (not just norm) through a ReLU-like nonlinearity, which is a stronger property than norm preservation alone.
-    #   Signals stay well-scaled through the network at init
-    # - std=0.01 for the policy head: this is the important one. When the final Linear layer has tiny weights, its output
-    #   logits are near zero for any input, which means softmax(logits) is nearly uniform — every action gets roughly equal
-    #   probability. This gives the policy maximum entropy at initialization, so it explores broadly for the first few updates
-    #   before the policy has any real information to concentrate on. Without this, random init might produce logits that already
-    #   strongly favor one action, and you spend the early episodes "un-learning" that arbitrary bias. This is arguably the single
-    #   most impactful trick for stable early training.
-    # - std=1.0 for the value head: preserves the natural scale, so V(s) starts near zero rather than at some arbitrary offset.
-    #   This matters because the critic's target (returns) is often around zero early on, and starting with V ≈ 0 means the critic
-    #   doesn't have to first "unwind" a large initial bias before learning the actual mapping
-    torch.nn.init.orthogonal_(layer.weight, gain=std)
-    torch.nn.init.constant_(layer.bias, val=bias)
-    return layer
 
 def process_observation(obs, obs_rms: RunningMeanStd, clip: Optional[float] = None, update_stats: bool=True):
     # Expects an obs from env.reset or env.step
@@ -605,40 +580,12 @@ def main(args):
     env_name = args[1]
     print("Environment: ", env_name)
     
-    class Actor(nn.Module):   
-        def __init__(self, obs_space: int, action_space: int, hidden: int = 64):
-            super().__init__()
-            self.obs_dim = obs_space.shape[0]
-            self.n_actions = action_space.n
-            self.net = nn.Sequential(
-                layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
-                layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
-                # Policy head: small init so initial logits are ~uniform
-                layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
-            )
-        def forward(self, x):
-            return self.net(x)  # logits
-        def dist(self, x):
-            return Categorical(logits=self.forward(x))
-
-    class Critic(nn.Module):
-        def __init__(self, obs_space: int, hidden: int = 64):
-            super().__init__()
-            self.obs_dim = obs_space.shape[0]
-            self.net = nn.Sequential(
-                layer_init(nn.Linear(self.obs_dim, hidden)), nn.Tanh(),
-                layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
-                layer_init(nn.Linear(hidden, 1), std=1.0),
-            )
-        def forward(self, x):
-            return self.net(x).squeeze(-1)
-    
     ppoTrainerConfig = PPOTrainerConfig(
         num_envs = 1,
         seed = 0,
         device = DEFAULT_DEVICE,
-        make_actor = lambda o, a: Actor(o, a),
-        make_critic = lambda o: Critic(o)
+        make_actor = lambda o, a: SimpleActor(o, a),
+        make_critic = lambda o: SimpleCritic(o)
     )
     
     trainer = PPOTrainer(env_name, ppoTrainerConfig)
