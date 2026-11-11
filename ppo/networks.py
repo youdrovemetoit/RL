@@ -76,18 +76,13 @@ class CNNEncoder(nn.Module):
         return self.cnn(x)
 
 class VisionActor(nn.Module):
-    def __init__(self, obs_space: int, action_space: int, cnn: CNNEncoder, hidden: int = 64):
+    def __init__(self, obs_space: int, action_space: int, cnn: CNNEncoder):
         super().__init__()
-
-        self.obs_dim = obs_space.shape[0]
         self.n_actions = action_space.n
-        print(f"Obs dim: {self.obs_dim}, Actions Dim: {self.n_actions}")
-
         self.cnn = cnn
 
         self.net = nn.Sequential(
-            layer_init(nn.Linear(512, hidden)), nn.Tanh(),
-            layer_init(nn.Linear(hidden, self.n_actions), std=0.01),
+            layer_init(nn.Linear(512, self.n_actions), std=0.01),
         )
 
     def forward(self, x):
@@ -98,12 +93,11 @@ class VisionActor(nn.Module):
         return Categorical(logits=self.forward(x))
 
 class VisionCritic(nn.Module):
-    def __init__(self, obs_space: int, cnn: CNNEncoder, hidden: int = 64):
+    def __init__(self, obs_space: int, cnn: CNNEncoder):
         super().__init__()
         self.cnn = cnn
         self.net = nn.Sequential(
-            layer_init(nn.Linear(512, hidden)), nn.Tanh(),
-            layer_init(nn.Linear(hidden, 1), std=1.0),
+            layer_init(nn.Linear(512, 1), std=1.0),
         )
 
     def forward(self, x):

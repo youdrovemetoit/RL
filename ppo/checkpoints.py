@@ -26,8 +26,9 @@ class CheckpointManager():
 
         # Make space for checkpointing
         run_dir = "." if self.trainer.run_dir is None else self.trainer.run_dir
-        checkpoints_path = os.path.join(run_dir, "checkpoints", self.trainer.env_id, f"seed_{self.trainer.seed}")
-        self.checkpoints_path = self._normalise_path(checkpoints_path)
+        # Sanitise only the env id (e.g. "ale_py:Breakout-v5"); run_dir may be an absolute Windows path like "C:\..."
+        env_dir = self.trainer.env_id.replace(':', '_')
+        self.checkpoints_path = os.path.join(run_dir, "checkpoints", env_dir, f"seed_{self.trainer.seed}")
         os.makedirs(self.checkpoints_path, exist_ok=True)
 
     def try_resume_from(self, resume_from: Optional[str]) -> tuple[bool, int]:
@@ -47,10 +48,6 @@ class CheckpointManager():
         latest = os.path.join(self.checkpoints_path, "latest.pt")
         self._save_checkpoint(latest, update=update, rollout_steps=rollout_steps)
         shutil.copyfile(latest, os.path.join(self.checkpoints_path, name))
-
-    def _normalise_path(self, path):
-        path = path.replace(':', '_')
-        return path
 
     def _save_checkpoint(self, path, update, rollout_steps):
         checkpoint = {

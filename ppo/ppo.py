@@ -10,8 +10,8 @@ from collections import deque
 import random
 import sys
 import timeit
-from checkpoints import CheckpointManager
-from networks import SimpleActor, SimpleCritic
+from .checkpoints import CheckpointManager
+from .networks import SimpleActor, SimpleCritic
 
 DEFAULT_DEVICE="cpu"
 

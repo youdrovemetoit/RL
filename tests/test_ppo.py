@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ppo import ppo
+import ppo
 
 # A simple gym environment that returns 1 on every step
 class ConstantEnv(gym.Env):
